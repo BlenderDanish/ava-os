@@ -20,6 +20,8 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
                           || (self->bed && self->bed->running());
     // transport: paused = the bed is still, the music keeps playing
     const float vibG = eng->params.vibOn.load() ? 1.0f : 0.0f;
+    const float* monL = self->monL_;
+    const float* monR = self->monR_;
 
     // Routing: music pair + surround pair + per-zone channels, all on the
     // chosen device. On a plain stereo device (≤2ch) fall back to a vibration
@@ -70,6 +72,11 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
             float v = monitor ? vibG * 0.8f * std::tanh(2.2f * m) : 0.0f;
             dst[i * ch] = vol * (mg * L[i] + v);
             if (ch > 1) dst[i * ch + 1] = vol * (mg * R[i] + v);
+            // the mic as heard follows the master like everything else
+            if (monL) {
+                if (ch > 1) { dst[i * ch] += vol * monL[i]; dst[i * ch + 1] += vol * monR[i]; }
+                else dst[i] += vol * 0.5f * (monL[i] + monR[i]);
+            }
         }
         // same limiter as the multichannel path
         const float ceil = 0.98f, aRel = 1.0f / (0.15f * 48000.0f);
@@ -89,6 +96,10 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
     }
     for (int i = 0; i < n; i++) {
         float* f = dst + (size_t)i * ch;
+        if (monL && musicL >= 0 && musicL < ch) {
+            f[musicL] += vol * monL[i];
+            if (musicL + 1 < ch) f[musicL + 1] += vol * monR[i];
+        }
         if (takeOver && musicL >= 0 && musicL < ch) {
             f[musicL] += vol * musicG * L[i];
             if (musicL + 1 < ch) f[musicL + 1] += vol * musicG * R[i];
@@ -194,7 +205,9 @@ void renderOutputBlock(OutputUnit* self, Engine* eng, float* dst, int n, int ch,
         if (avail > target + 2 * n) ring->discard(avail - target);
     }
     self->ring()->pop(L.data(), R.data(), n);
-    // what the speakers get: the tap alone unless the input is routed there
+    self->monL_ = self->monR_ = nullptr;
+    // what the speakers get: the tap alone (a heard input is added in the
+    // mixer, undelayed, via monL_/monR_)
     static thread_local std::vector<float> mL, mR;
     mL.assign(L.begin(), L.begin() + n); mR.assign(R.begin(), R.begin() + n);
     if (StereoRing* ir = self->inRing) {
@@ -203,14 +216,18 @@ void renderOutputBlock(OutputUnit* self, Engine* eng, float* dst, int n, int ch,
         if (avail > n + 128 + 2 * n) ir->discard(avail - (n + 128));
         static thread_local std::vector<float> iL, iR;
         iL.assign(n, 0.0f); iR.assign(n, 0.0f);
-        if (avail >= n) {
-            ir->pop(iL.data(), iR.data(), n);
-            bool hear = self->inToSpeakers.load();
-            for (int i = 0; i < n; i++) {
-                L[i] += iL[i]; R[i] += iR[i];
-                if (hear) { mL[i] += iL[i]; mR[i] += iR[i]; }
-            }
+        if (avail >= n) ir->pop(iL.data(), iR.data(), n);
+        // effects run on silence too, so echo and reverb tails ring out
+        self->micFx.process(iL.data(), iR.data(), n);
+        // MIC level, ramped across the block so moving it never clicks
+        const float mic1 = std::min(2.0f, std::max(0.0f, self->micLevel.load())), mic0 = self->micG_;
+        for (int i = 0; i < n; i++) {
+            float mic = mic0 + (mic1 - mic0) * (i + 1) / (float)n;
+            iL[i] *= mic; iR[i] *= mic;
+            L[i] += iL[i]; R[i] += iR[i];
         }
+        self->micG_ = mic1;
+        if (self->inToSpeakers.load()) { self->monL_ = iL.data(); self->monR_ = iR.data(); }
     }
     // authored content owns the bed: a live DAW feed first, else a stem set.
     // Its music replaces the tap; zones it brings replace the engine's; zones
@@ -260,6 +277,7 @@ void renderOutputBlock(OutputUnit* self, Engine* eng, float* dst, int n, int ch,
                     outZ[z] = vibPtr[z]; vibR[z] = eng->rightOut(z);
                 }
             }
+            self->micFx.bodyEcho(outZ, vibR, n);
             mixOutputBlock(self, eng, mL.data(), mR.data(), outZ, vibR, dst, n, ch);
             return;
         }
@@ -269,5 +287,6 @@ void renderOutputBlock(OutputUnit* self, Engine* eng, float* dst, int n, int ch,
     eng->delayMusic(mL.data(), mR.data(), mL.data(), mR.data(), n);
     const float* vibR[NZONES];
     for (int z = 0; z < NZONES; z++) vibR[z] = eng->rightOut(z);
+    self->micFx.bodyEcho(vibPtr, vibR, n);
     mixOutputBlock(self, eng, mL.data(), mR.data(), vibPtr, vibR, dst, n, ch);
 }

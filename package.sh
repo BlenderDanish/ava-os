@@ -31,7 +31,7 @@ cp -R "$APP" "dist/AVA OS/"
 cat > "dist/AVA OS/README.txt" <<'EOF'
 AVA OS
 ==============
-Live vibroacoustic engine for the SoundTemple. Listens to whatever your Mac is
+Live vibroacoustic engine for the AVA bed. Listens to whatever your Mac is
 playing and generates five vibration zone channels (Head / Heart / Belly /
 Butt / Feet) in real time, plus the stereo music feed.
 

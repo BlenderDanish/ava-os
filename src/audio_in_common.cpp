@@ -11,15 +11,19 @@ void InputUnit::processBlock(const float* in, int ch, int nFrames) {
     float g = gain.load();
     static thread_local std::vector<float> L, R;
     L.resize(nFrames); R.resize(nFrames);
-    // raw (post user gain, pre guard) peak decides the guard; the guard's
+    // the interface's own peak (before GAIN) decides the guard; the guard's
     // trim is then applied with a ~50 ms slew so steps are inaudible
-    float pkRaw = 0;
+    float pkRaw = 0, pkGain = 0;
     for (int i = 0; i < nFrames; i++) {
-        float l = in[(size_t)i * ch + cl] * g, r = in[(size_t)i * ch + cr] * g;
-        L[i] = l; R[i] = r;
+        float l = in[(size_t)i * ch + cl], r = in[(size_t)i * ch + cr];
         pkRaw = std::max(pkRaw, std::max(std::fabs(l), std::fabs(r)));
+        L[i] = l * g; R[i] = r * g;
     }
+    pkGain = pkRaw * g;
     const float dt = nFrames / 48000.0f;
+    // FIT: remember the loudest post-GAIN peak, letting it fall over ~4 s
+    hotPk_ = std::max(pkGain, hotPk_ * std::exp(-dt / 4.0f));
+    hotPeak.store(hotPk_);
     float clip = clipHold.load();
     if (pkRaw > 0.97f) {
         clip = 1.5f;
@@ -42,13 +46,21 @@ void InputUnit::processBlock(const float* in, int ch, int nFrames) {
     }
     clipHold.store(clip);
     const float aT = 1.0f / (0.05f * 48000.0f);
-    float t = trim_, pk = 0;
+    const float ceil = std::min(1.0f, std::max(0.25f, limitCeil.load()));
+    const float rel = 1.0f - std::exp(-1.0f / (0.1f * 48000.0f));
+    float t = trim_, pk = 0, lg = limG_, minG = 1.0f;
     for (int i = 0; i < nFrames; i++) {
         t += (trimTarget_ - t) * aT;
-        L[i] *= t; R[i] *= t;
+        float l = L[i] * t, r = R[i] * t;
+        float a = std::max(std::fabs(l), std::fabs(r));
+        lg += (1.0f - lg) * rel;
+        if (a * lg > ceil) lg = ceil / a;            // never over the ceiling
+        minG = std::min(minG, lg);
+        L[i] = l * lg; R[i] = r * lg;
         pk = std::max(pk, std::max(std::fabs(L[i]), std::fabs(R[i])));
     }
-    trim_ = t;
+    trim_ = t; limG_ = lg;
+    limitRed.store(-20.0f * std::log10(std::max(minG, 1e-4f)));
     autoTrim.store(t);
     float prev = peak.load() * 0.9f;
     peak.store(pk > prev ? pk : prev);

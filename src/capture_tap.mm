@@ -88,7 +88,7 @@ bool SystemTap::start(StereoRing* ring) {
         NSDictionary* aggDesc = @{
             @(kAudioAggregateDeviceNameKey): @"AVA Tap Aggregate",
             @(kAudioAggregateDeviceUIDKey):
-                [NSString stringWithFormat:@"nyc.soundtemple.tapagg.%d", getpid()],
+                [NSString stringWithFormat:@"com.avartifacts.tapagg.%d", getpid()],
             @(kAudioAggregateDeviceIsPrivateKey): @YES,
             @(kAudioAggregateDeviceTapAutoStartKey): @YES,
             @(kAudioAggregateDeviceTapListKey): @[@{

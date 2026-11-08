@@ -5,6 +5,34 @@
 #include <cmath>
 #include <cstring>
 
+// AUHAL's input side does no sample-rate conversion: ask it for 48 kHz while
+// the device runs at 44.1 and every AudioUnitRender fails with -10863, so
+// the input is silent. Capture at the device's own rate instead and bring
+// each block to 48 kHz here (linear; the engine only listens below ~200 Hz).
+// Returns the frame count in `out`, or 0 when no conversion is needed.
+static int resampleTo48k(const float* in, int nFrames, int ch, double hwRate,
+                         double& pos, std::vector<float>& prev, std::vector<float>& out) {
+    if (hwRate <= 0 || std::fabs(hwRate - 48000.0) < 1.0) return 0;
+    const double step = hwRate / 48000.0;   // input frames per output frame
+    if ((int)prev.size() != ch) { prev.assign(ch, 0.0f); pos = 0; }
+    out.resize((size_t)(nFrames / step + 4) * ch);
+    int n = 0;
+    // pos is in input frames; -1 is the previous block's last frame
+    while (pos < nFrames - 1) {
+        int i0 = (int)std::floor(pos);
+        float f = (float)(pos - i0);
+        const float* a = i0 < 0 ? prev.data() : in + (size_t)i0 * ch;
+        const float* b = in + (size_t)(i0 + 1) * ch;
+        float* o = out.data() + (size_t)n * ch;
+        for (int c = 0; c < ch; c++) o[c] = a[c] + (b[c] - a[c]) * f;
+        n++;
+        pos += step;
+    }
+    pos -= nFrames;
+    std::memcpy(prev.data(), in + (size_t)(nFrames - 1) * ch, (size_t)ch * sizeof(float));
+    return n;
+}
+
 static OSStatus inputCB(void* refCon, AudioUnitRenderActionFlags* flags,
                         const AudioTimeStamp* ts, UInt32 bus, UInt32 nFrames, AudioBufferList*) {
     auto* self = (InputUnit*)refCon;
@@ -20,7 +48,9 @@ static OSStatus inputCB(void* refCon, AudioUnitRenderActionFlags* flags,
     OSStatus err = AudioUnitRender((AudioUnit)self->unit_, flags, ts, bus, nFrames, &abl);
     self->lastErr.store((int)err, std::memory_order_relaxed);
     if (err != noErr) return err;
-    self->processBlock(self->scratch_.data(), ch, (int)nFrames);
+    int rs = resampleTo48k(self->scratch_.data(), (int)nFrames, ch, self->hwRate, self->rsPos_, self->rsPrev_, self->rsOut_);
+    if (rs > 0) self->processBlock(self->rsOut_.data(), ch, rs);
+    else self->processBlock(self->scratch_.data(), ch, (int)nFrames);
     return noErr;
 }
 
@@ -62,8 +92,10 @@ bool InputUnit::start(unsigned deviceID, StereoRing* ring) {
     hwRate = devFmt.mSampleRate;
     cbCount.store(0); lastErr.store(0);
     if (deviceChannels <= 0) { lastError = "device has no input"; AudioComponentInstanceDispose(unit); return false; }
+    if (hwRate <= 0) hwRate = 48000;
+    rsPos_ = 0; rsPrev_.clear();
     AudioStreamBasicDescription fmt{};
-    fmt.mSampleRate = 48000; fmt.mFormatID = kAudioFormatLinearPCM;
+    fmt.mSampleRate = hwRate; fmt.mFormatID = kAudioFormatLinearPCM;
     fmt.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
     fmt.mChannelsPerFrame = (UInt32)deviceChannels; fmt.mBitsPerChannel = 32;
     fmt.mFramesPerPacket = 1; fmt.mBytesPerFrame = 4 * fmt.mChannelsPerFrame; fmt.mBytesPerPacket = fmt.mBytesPerFrame;
@@ -107,12 +139,15 @@ static OSStatus bedCB(void* refCon, AudioUnitRenderActionFlags* flags,
     abl.mBuffers[0].mData = self->scratch_.data();
     OSStatus err = AudioUnitRender((AudioUnit)self->unit_, flags, ts, bus, nFrames, &abl);
     if (err != noErr) return err;
+    const float* blk = self->scratch_.data();
+    int nf = (int)nFrames;
+    if (int rs = resampleTo48k(blk, nf, ch, self->hwRate, self->rsPos_, self->rsPrev_, self->rsOut_)) { blk = self->rsOut_.data(); nf = rs; }
     int first = std::min(std::max(self->firstChan.load(), 0), std::max(0, ch - 1));
-    self->ring.pushInterleaved(self->scratch_.data(), (int)nFrames, ch, first);
+    self->ring.pushInterleaved(blk, nf, ch, first);
     for (int c = 0; c < BedInput::kCh; c++) {
         int sc = first + c;
         float pk = 0;
-        if (sc < ch) for (UInt32 i = 0; i < nFrames; i++) pk = std::max(pk, std::fabs(self->scratch_[i * ch + sc]));
+        if (sc < ch) for (int i = 0; i < nf; i++) pk = std::max(pk, std::fabs(blk[(size_t)i * ch + sc]));
         float prev = self->peak[c].load(std::memory_order_relaxed) * 0.9f;
         self->peak[c].store(pk > prev ? pk : prev, std::memory_order_relaxed);
     }
@@ -140,8 +175,10 @@ bool BedInput::start(unsigned devID) {
     AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &devFmt, &sz);
     deviceChannels = (int)devFmt.mChannelsPerFrame;
     if (deviceChannels < 2) { lastError = "device has fewer than 2 inputs"; AudioComponentInstanceDispose(unit); return false; }
+    hwRate = devFmt.mSampleRate > 0 ? devFmt.mSampleRate : 48000;
+    rsPos_ = 0; rsPrev_.clear();
     AudioStreamBasicDescription fmt{};
-    fmt.mSampleRate = 48000; fmt.mFormatID = kAudioFormatLinearPCM;
+    fmt.mSampleRate = hwRate; fmt.mFormatID = kAudioFormatLinearPCM;
     fmt.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
     fmt.mChannelsPerFrame = (UInt32)deviceChannels; fmt.mBitsPerChannel = 32;
     fmt.mFramesPerPacket = 1; fmt.mBytesPerFrame = 4 * fmt.mChannelsPerFrame; fmt.mBytesPerPacket = fmt.mBytesPerFrame;
@@ -202,7 +239,18 @@ std::vector<OutDevice> listInputDevices() {
         Float64 rate = 48000; UInt32 rateSz = sizeof(rate);
         AudioObjectPropertyAddress rateAddr = {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
         AudioObjectGetPropertyData(id, &rateAddr, 0, nullptr, &rateSz, &rate);
-        out.push_back({(unsigned)id, name, ch, rate});
+        UInt32 tt = 0, ttSz = sizeof(tt);
+        AudioObjectPropertyAddress ttAddr = {kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+        AudioObjectGetPropertyData(id, &ttAddr, 0, nullptr, &ttSz, &tt);
+        // an iPhone's Continuity mic (or anything macOS can't name) only wins
+        // when there is nothing else: it hops on uninvited whenever the phone is near
+        const bool continuity = tt == 'ccwd' || tt == 'ccwl' || tt == 0;
+        int rank = tt == kAudioDeviceTransportTypeUSB ? 4
+                 : tt == kAudioDeviceTransportTypeBuiltIn ? 2
+                 : (tt == kAudioDeviceTransportTypeVirtual || tt == kAudioDeviceTransportTypeAggregate
+                    || tt == kAudioDeviceTransportTypeAutoAggregate) ? 0
+                 : continuity ? 1 : 3;
+        out.push_back({(unsigned)id, name, ch, rate, rank});
     }
     return out;
 }

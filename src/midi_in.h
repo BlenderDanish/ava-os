@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,16 @@ public:
     // drain pending events (UI thread)
     std::vector<MidiEvent> poll();
 
+    // master switch: off = every source disconnected, nothing heard (so a DAW
+    // like Ableton can own the controllers without AVA reacting too)
+    void setEnabled(bool on);
+    bool enabled() const { return enabled_.load(); }
+    // per-device switch, remembered by display name
+    struct Source { std::string name; bool on; };
+    std::vector<Source> sources();          // every source seen at last rescan
+    void setBlocked(const std::string& name, bool blocked);
+    std::set<std::string> blocked();
+
     bool connected() const { return nConnected_.load() > 0; }
     std::string deviceName(); // first source's display name, "" if none
     std::atomic<uint32_t> activity{0}; // bumps on every parsed event
@@ -38,4 +49,7 @@ private:
     std::vector<uint32_t> connected_; // MIDIEndpointRef values already connected
     std::atomic<int> nConnected_{0};
     std::string name_; // guarded by mu_
+    std::vector<Source> sources_; // guarded by mu_
+    std::set<std::string> blocked_; // guarded by mu_
+    std::atomic<bool> enabled_{true};
 };

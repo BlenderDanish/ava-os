@@ -65,10 +65,48 @@ void MidiIn::stop() {
     nConnected_.store(0);
 }
 
+static std::string srcName(MIDIEndpointRef src) {
+    CFStringRef nm = nullptr;
+    MIDIObjectGetStringProperty(src, kMIDIPropertyDisplayName, &nm);
+    if (!nm) return "?";
+    char buf[256] = {0};
+    CFStringGetCString(nm, buf, sizeof(buf), kCFStringEncodingUTF8);
+    CFRelease(nm);
+    return buf;
+}
+
+void MidiIn::setEnabled(bool on) {
+    enabled_.store(on);
+    rescan();
+    if (!on) { std::lock_guard<std::mutex> lk(mu_); q_.clear(); }
+}
+
+void MidiIn::setBlocked(const std::string& name, bool b) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (b) blocked_.insert(name); else blocked_.erase(name);
+    }
+    rescan();
+}
+
+std::set<std::string> MidiIn::blocked() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return blocked_;
+}
+
+std::vector<MidiIn::Source> MidiIn::sources() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return sources_;
+}
+
 void MidiIn::rescan() {
     if (!port_) return;
+    MIDIPortRef port = (MIDIPortRef)(uintptr_t)port_;
+    std::set<std::string> blk = blocked();
+    bool en = enabled_.load();
     ItemCount n = MIDIGetNumberOfSources();
     std::vector<uint32_t> live;
+    std::vector<Source> all;
     std::string firstName;
     for (ItemCount i = 0; i < n; i++) {
         MIDIEndpointRef src = MIDIGetSource(i);
@@ -79,32 +117,30 @@ void MidiIn::rescan() {
         if (MIDIObjectGetIntegerProperty(src, kMIDIPropertyUniqueID, &uid) == noErr &&
             uid == 0x41564131)
             continue;
-        live.push_back((uint32_t)src);
+        std::string nm = srcName(src);
+        bool want = en && !blk.count(nm);
+        all.push_back({nm, !blk.count(nm)});
         bool known = false;
         for (uint32_t c : connected_) if (c == (uint32_t)src) known = true;
-        if (!known) {
-            MIDIPortConnectSource((MIDIPortRef)(uintptr_t)port_, src, nullptr);
-            CFStringRef cn = nullptr;
-            MIDIObjectGetStringProperty(src, kMIDIPropertyDisplayName, &cn);
-            char cb[128] = "?";
-            if (cn) { CFStringGetCString(cn, cb, sizeof(cb), kCFStringEncodingUTF8); CFRelease(cn); }
-            fprintf(stderr, "[MIDI] connected %s\n", cb);
-        }
-        if (firstName.empty()) {
-            CFStringRef nm = nullptr;
-            MIDIObjectGetStringProperty(src, kMIDIPropertyDisplayName, &nm);
-            if (nm) {
-                char buf[256] = {0};
-                CFStringGetCString(nm, buf, sizeof(buf), kCFStringEncodingUTF8);
-                firstName = buf;
-                CFRelease(nm);
+        if (!want) {
+            if (known) {
+                MIDIPortDisconnectSource(port, src);
+                fprintf(stderr, "[MIDI] disconnected %s\n", nm.c_str());
             }
+            continue;
         }
+        live.push_back((uint32_t)src);
+        if (!known) {
+            MIDIPortConnectSource(port, src, nullptr);
+            fprintf(stderr, "[MIDI] connected %s\n", nm.c_str());
+        }
+        if (firstName.empty()) firstName = nm;
     }
     connected_ = live;
     nConnected_.store((int)live.size());
     std::lock_guard<std::mutex> lk(mu_);
     name_ = firstName;
+    sources_ = all;
 }
 
 std::vector<MidiEvent> MidiIn::poll() {
@@ -120,6 +156,7 @@ std::string MidiIn::deviceName() {
 }
 
 void MidiIn::push(const MidiEvent& e) {
+    if (!enabled_.load()) return; // late packets from a source being dropped
     activity.fetch_add(1, std::memory_order_relaxed);
     if (e.type == 0x90) fprintf(stderr, "[MIDI] note on %d vel %d\n", e.a, e.b);
     std::lock_guard<std::mutex> lk(mu_);

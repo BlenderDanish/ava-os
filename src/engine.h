@@ -131,6 +131,14 @@ struct Params {
     std::atomic<int>   fxStrobe{0};  // 9 Hz square gate
     std::atomic<int>   fxChoke{0};   // hard mute (20 ms fade)
     std::atomic<float> fxTrem{0};    // tremolo depth 0..0.6 @ 5.5 Hz (mod wheel)
+    // SWEEP: one playable resonant filter over the whole vibration output.
+    // mode 0 = off, 1 = LP, 2 = BP, 3 = HP. cutoff 0..1 → 12..250 Hz (log),
+    // reso 0..1 → Q 0.6..6, tilt -1..1 offsets each zone's cutoff along the
+    // body (+ = head opens first, - = feet first, ±1.5 oct at the ends).
+    std::atomic<int>   sweepMode{0};
+    std::atomic<float> sweepCutoff{0.6f};
+    std::atomic<float> sweepReso{0.3f};
+    std::atomic<float> sweepTilt{0.0f};
 };
 
 // Pad voice library. Every voice is one row: a generic synth in engine.cpp
@@ -402,6 +410,12 @@ private:
     float fxG_ = 1.0f;       // smoothed strobe/choke gate
     float strobePh_ = 0;     // 0..1 phase of the 9 Hz gate
     float tremPh_ = 0;       // radians
+    // SWEEP filter state: cutoff/Q smoothed per sample (~15 ms) so knob and
+    // CC moves glide; mix fades the filter in/out when the mode toggles
+    dsp::SVF sweepL_[NZONES], sweepR_[NZONES];
+    dsp::SVFCoef sweepC_[NZONES];
+    float sweepLogFc_ = 0, sweepQ_ = 1, sweepTilt_ = 0, sweepMix_ = 0;
+    int sweepModeCur_ = 0;
 
 public:
     std::atomic<float> breathNow{0}; // UI: current breath gain 0..1

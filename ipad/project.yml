@@ -23,7 +23,7 @@ targets:
       - sdk: AVFoundation.framework
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: nyc.soundtemple.ava
+        PRODUCT_BUNDLE_IDENTIFIER: com.avartifacts.ava
         PRODUCT_NAME: "AVA OS"
         DEVELOPMENT_TEAM: JSWF5RVAU3
         CODE_SIGN_STYLE: Automatic

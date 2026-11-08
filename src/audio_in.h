@@ -43,15 +43,30 @@ public:
     // been quiet for a while it eases back up 1 dB at a time. autoTrim is
     // the factor currently applied (1 = none); clipHold > 0 while the raw
     // input has hit full scale in the last ~1.5 s (UI "CLIP" flag).
+    // The guard listens to the interface itself (before GAIN): only a signal
+    // that is already at full scale coming out of the interface — a preamp
+    // set too hot, or feedback — trips it. clipHold is that flag.
     std::atomic<float> autoTrim{1.0f};
     std::atomic<float> clipHold{0.0f};
     float trim_ = 1.0f, trimTarget_ = 1.0f, hotSec_ = 0, coolSec_ = 0;
+    // limiter after GAIN and the guard: instant attack, 100 ms release, so
+    // turning GAIN up can never clip — peaks are held at limitCeil (linear).
+    // limitRed = reduction in dB right now (UI); hotPeak = loudest post-GAIN
+    // peak of the last few seconds, for the FIT button.
+    std::atomic<float> limitCeil{0.89f};
+    std::atomic<float> limitRed{0.0f};
+    std::atomic<float> hotPeak{0.0f};
+    float limG_ = 1.0f, hotPk_ = 0;
     StereoRing* ring() { return ring_; }
     // audio thread, both platforms: interleaved float frames of `ch`
     // channels → L/R pick, gain, guard, peak, into the ring
     void processBlock(const float* interleaved, int ch, int nFrames);
     void* unit_ = nullptr;
     std::vector<float> scratch_;
+    // capture runs at the device's own rate (AUHAL input cannot convert);
+    // blocks are brought to 48 kHz here (see resampleTo48k in audio_in.mm)
+    double rsPos_ = 0;
+    std::vector<float> rsPrev_, rsOut_;
 private:
     std::atomic<bool> running_{false};
     StereoRing* ring_ = nullptr;

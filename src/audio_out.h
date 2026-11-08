@@ -14,12 +14,17 @@
 #include "stem_player.h"
 #include "bed_input.h"
 #include "dsp.h"
+#include "mic_fx.h"
 
 struct OutDevice {
     unsigned id;
     std::string name;
     int channels;
     double sampleRate;
+    // inputs only: how likely this is a mic someone plugged in to talk into —
+    // 4 USB, 3 other hardware / Bluetooth, 2 built-in, 1 iPhone (Continuity) /
+    // unknown, 0 virtual / aggregate
+    int micRank = 0;
 };
 
 std::vector<OutDevice> listOutputDevices();
@@ -65,8 +70,19 @@ public:
     // authored ones are held back by the engine's look-ahead so all align
     dsp::DelayLine bedDelay_[NZONES];
     // live input goes to the ENGINE only by default (felt, not heard); on =
-    // also mixed into the music / surround sends
+    // also heard on the stereo pair / music channels (the MIC button)
     std::atomic<bool> inToSpeakers{false};
+    // effects on the live input (heard and felt) + body echo on the zones
+    MicFx micFx;
+    // MIC level ×0..2, on its own (the music has params.musicGain): what is
+    // heard and what the engine turns into vibration
+    std::atomic<float> micLevel{1.0f};
+    float micG_ = 1.0f;   // audio thread: last block's gain (ramped)
+    // the live input as heard (inToSpeakers): straight to the stereo pair /
+    // music channels, never through the sync look-ahead — talking into a mic
+    // has to come back instantly. Set per block by renderOutputBlock.
+    const float* monL_ = nullptr;
+    const float* monR_ = nullptr;
     // true when the capture path silences the source apps (macOS process
     // tap): on a plain stereo device we must then play the music ourselves.
     // WASAPI loopback (Windows) leaves the source audible, so false there.

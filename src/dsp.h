@@ -36,6 +36,31 @@ struct Biquad {
     }
 };
 
+// ── State-variable filter (Cytomic TPT) ─────────────────────────────────
+// LP / BP / HP from one structure; stays stable while the cutoff is swept
+// every sample, which a redesigned biquad does not. Coefs are shared so one
+// SVFCoef can drive the L and R state of a zone.
+struct SVFCoef {
+    float a1 = 1, a2 = 0, a3 = 0, k = 1.41421356f;
+    void set(float fc, float sr, float q) {
+        float g = std::tan(kPi * fc / sr);
+        k = 1.0f / q;
+        a1 = 1.0f / (1.0f + g * (g + k)); a2 = g * a1; a3 = g * a2;
+    }
+};
+struct SVF {
+    float ic1 = 0, ic2 = 0;
+    // mode 1 = low-pass, 2 = band-pass (unity peak), 3 = high-pass
+    inline float process(float v0, const SVFCoef& c, int mode) {
+        float v3 = v0 - ic2;
+        float v1 = c.a1 * ic1 + c.a2 * v3;
+        float v2 = ic2 + c.a2 * ic1 + c.a3 * v3;
+        ic1 = 2 * v1 - ic1; ic2 = 2 * v2 - ic2;
+        return mode == 1 ? v2 : mode == 2 ? c.k * v1 : v0 - c.k * v1 - v2;
+    }
+    void reset() { ic1 = ic2 = 0; }
+};
+
 // Butterworth cascade: N-order lowpass as N/2 biquads with butterworth Qs
 struct ButterLP {
     Biquad s[3];

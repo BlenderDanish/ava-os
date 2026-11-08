@@ -29,6 +29,8 @@ public:
     MultiRing ring;
     // capture side (audio thread)
     std::vector<float> scratch_;
+    double hwRate = 48000, rsPos_ = 0;   // capture at the device rate → 48 kHz (audio_in.mm)
+    std::vector<float> rsPrev_, rsOut_;
     void* unit_ = nullptr;
     void setRunning(bool b) { running_.store(b); }
 private:

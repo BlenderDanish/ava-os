@@ -56,6 +56,7 @@ void Engine::init() {
         zoneToneLP_[z].lowpass(200.0f, kSR); zoneToneLPR_[z].lowpass(200.0f, kSR);
         zoneToneFc_[z] = 200.0f;
     }
+    sweepLogFc_ = std::log(80.0f);
 
     // SPLIT mode: real low bands pass straight to the body; the layers that
     // live above the felt range are tracked and folded down
@@ -211,6 +212,16 @@ void Engine::process(const float* inL, const float* inR, float** out, int n) {
     float pkPulse = 0, pkFlow = 0, pkWarm = 0, pkDepth = 0, pkDyn = 0, pkLift = 0;
     const float fxTremD = params.fxTrem.load();
     const float fxCoef = std::exp(-1.0f / (0.008f * kSR));
+    // SWEEP targets for this block; a mode change fades the filter out
+    // (~10 ms), swaps mode with fresh state, then fades back in
+    const int sweepWant = std::min(3, std::max(0, params.sweepMode.load()));
+    const float sweepFcT = std::log(12.0f) + std::log(250.0f / 12.0f) *
+                           std::min(1.0f, std::max(0.0f, params.sweepCutoff.load()));
+    const float sweepQT = 0.6f * std::pow(10.0f, std::min(1.0f, std::max(0.0f, params.sweepReso.load())));
+    const float sweepTiltT = std::min(1.0f, std::max(-1.0f, params.sweepTilt.load()));
+    const float sweepSm = 1.0f - std::exp(-1.0f / (0.015f * kSR));
+    const float sweepMixK = 1.0f - std::exp(-1.0f / (0.004f * kSR));
+    static const float kZonePos[NZONES] = {1.0f, 0.5f, 0.0f, -0.5f, -1.0f};   // head → feet
 
     // look-ahead for this block; detector latencies to back-date events by
     // listen mode cannot delay the music, so it must not delay the bed either
@@ -509,6 +520,32 @@ void Engine::process(const float* inL, const float* inR, float** out, int n) {
             if (tremPh_ > dsp::kTwoPi) tremPh_ -= dsp::kTwoPi;
             tremG = 1.0f - fxTremD * 0.5f * (1.0f + std::sin(tremPh_));
         }
+        // SWEEP: glide cutoff/Q, refresh the per-zone coefs every 16 samples
+        float sweepComp = 1.0f;
+        {
+            if (sweepWant != sweepModeCur_ && sweepMix_ < 1e-3f) {
+                sweepModeCur_ = sweepWant;
+                for (int z = 0; z < NZONES; z++) { sweepL_[z].reset(); sweepR_[z].reset(); }
+            }
+            float mixT = (sweepWant == sweepModeCur_ && sweepModeCur_ != 0) ? 1.0f : 0.0f;
+            sweepMix_ += (mixT - sweepMix_) * sweepMixK;
+            if (sweepModeCur_ != 0) {
+                sweepLogFc_ += (sweepFcT - sweepLogFc_) * sweepSm;
+                sweepQ_ += (sweepQT - sweepQ_) * sweepSm;
+                sweepTilt_ += (sweepTiltT - sweepTilt_) * sweepSm;
+                if ((i & 15) == 0)
+                    for (int z = 0; z < NZONES; z++) {
+                        float fc = std::exp(sweepLogFc_) * std::pow(2.0f, 1.5f * sweepTilt_ * kZonePos[z]);
+                        sweepC_[z].set(std::min(1000.0f, std::max(8.0f, fc)), kSR, sweepQ_);
+                    }
+                // LP/HP peak at ~Q: pull resonant settings back toward unity so
+                // a screaming peak cannot overdrive a voice coil (BP is unity)
+                if (sweepModeCur_ != 2) sweepComp = 1.0f / std::sqrt(std::max(1.0f, sweepQ_));
+            } else {
+                // parked: follow the knobs instantly so switching on doesn't swoop
+                sweepLogFc_ = sweepFcT; sweepQ_ = sweepQT; sweepTilt_ = sweepTiltT;
+            }
+        }
 
         // ── SPLIT: five layers of the song, one per zone ──
         float split[NZONES] = {0, 0, 0, 0, 0};
@@ -755,6 +792,15 @@ void Engine::process(const float* inL, const float* inR, float** out, int n) {
             }
             o *= fxG_ * tremG;
             if (stereoMode) oR *= fxG_ * tremG;
+            // SWEEP (global, playable): crossfaded by sweepMix_ so toggles never click
+            if (sweepModeCur_ != 0 && sweepMix_ > 1e-4f) {
+                float f = sweepComp * sweepL_[z].process(o, sweepC_[z], sweepModeCur_);
+                o += sweepMix_ * (f - o);
+                if (stereoMode) {
+                    float fr = sweepComp * sweepR_[z].process(oR, sweepC_[z], sweepModeCur_);
+                    oR += sweepMix_ * (fr - oR);
+                }
+            }
             // layer effects (per zone, preset-independent): tone → drive → pulse
             if (layerTone[z]) { o = zoneToneLP_[z].process(o); if (stereoMode) oR = zoneToneLPR_[z].process(oR); }
             if (layerDrive[z] > 0.001f) {

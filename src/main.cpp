@@ -1,5 +1,5 @@
 // AVA OS — live system-audio vibroacoustic engine
-// UI closely mirrors the SoundTemple octagon control surface:
+// UI closely mirrors the AVA octagon control surface:
 // left octagon visualization, right glass panel with preset tabs,
 // master waveform, and five zone slider columns.
 #include <cstdio>
@@ -117,6 +117,8 @@ static int gActivePreset = 7;                     // index into kPresets (the st
 static const char* kKeyNames[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
 
 static ImU32 W(float a) { return IM_COL32(255, 255, 255, (int)(a * 255)); }
+// SWEEP filter moved from MIDI (audio-rate CCs): saved lazily by the UI loop
+static bool gSweepDirty = false;
 
 static void applyPresetTuning(int t);   // defined after the tunings table
 static void applyPreset(int p) {
@@ -205,13 +207,19 @@ static void playToneAsync(const std::string& path) {
 static std::atomic<int> gTapState{0};   // 0 idle · 1 starting · 2 finished
 static std::string gTapErr;             // copy of the tap's error, read once state == 2
 static double gTapStartT = 0;
+// LISTEN off = AVA doesn't capture the Mac's audio at all: no tap, no orange
+// dot, the bed doesn't follow whatever Ableton is playing. Pads, MIDI, VFX and
+// the effects still play on their own (on silence). Remembered (listen.txt).
+static std::atomic<bool> gListenOn{true};
 static void startTapAsync() {
+    if (!gListenOn.load()) return;
     if (gTapState.load() == 1 || gTap.running()) return;
     gTapState.store(1);
     gTapStartT = glfwGetTime();
     std::thread([] {
         gTap.start(&gRing);
         gTapErr = gTap.lastError;
+        if (!gListenOn.load() && gTap.running()) { gTap.stop(); gTap.inputPeak.store(0); }
         gTapState.store(2);
     }).detach();
 }
@@ -276,6 +284,54 @@ static void setInput(bool on) {
                 gInDevName.c_str(), gIn.deviceChannels, gIn.chanL.load() + 1, gIn.chanR.load() + 1);
     } else fprintf(stderr, "[input] %s (%s)\n", gIn.lastError.c_str(), gInDevName.c_str());
 }
+// MIC: talk into a mic and hear it (and feel it on the bed). Picks the mic
+// someone most likely just plugged in — USB first, then other hardware /
+// Bluetooth, the built-in mic last, never a virtual device — and remembers
+// what the live input was doing so turning the mic off puts it back.
+static bool gMicOn = false;
+static unsigned gMicDevId = 0;          // 0 = pick automatically
+static unsigned gMicPrevDevId = 0;
+static bool gMicPrevInOn = true;
+// the mic picked by hand, remembered by name across launches (mic.txt; empty = automatic)
+static std::string gMicName;
+static std::string appSupportFile(const char* name);
+static void saveMicChoice() {
+    if (FILE* f = fopen(appSupportFile("mic.txt").c_str(), "w")) { fprintf(f, "%s\n", gMicName.c_str()); fclose(f); }
+}
+static void loadMicChoice() {
+    FILE* f = fopen(appSupportFile("mic.txt").c_str(), "r");
+    if (!f) return;
+    char buf[256] = {0};
+    if (fgets(buf, sizeof(buf), f)) { gMicName = buf; while (!gMicName.empty() && (gMicName.back() == '\n' || gMicName.back() == '\r')) gMicName.pop_back(); }
+    fclose(f);
+}
+static unsigned pickMic() {
+    auto ins = listInputDevices();
+    const OutDevice* best = nullptr;
+    for (auto& d : ins) if (!best || d.micRank > best->micRank) best = &d;
+    if (best && best->micRank > 0) return best->id;
+    return defaultInputDevice();
+}
+static void startAudio();
+static void setMic(bool on) {
+    if (on == gMicOn) return;
+    if (on) {
+        gMicPrevDevId = gInDevId; gMicPrevInOn = gInOn;
+        unsigned dev = gMicDevId;
+        if (dev) { bool found = false; for (auto& d : listInputDevices()) if (d.id == dev) found = true; if (!found) dev = 0; }
+        if (!dev && !gMicName.empty())   // the remembered mic, if it's plugged in
+            for (auto& d : listInputDevices()) if (d.name == gMicName) { dev = d.id; break; }
+        gInDevId = dev ? dev : pickMic();
+        setInput(true);
+        gOut.inToSpeakers.store(true);
+        if (!gOut.running()) startAudio();
+    } else {
+        gOut.inToSpeakers.store(false);
+        gInDevId = gMicPrevDevId;
+        setInput(gMicPrevInOn);
+    }
+    gMicOn = on;
+}
 // Listen (default) vs take over. Take over is the temple setup: the music
 // goes out through AVA's own music channels on the interface, in step with
 // the bed. Everyone else just listens: nothing about their sound changes.
@@ -285,6 +341,28 @@ static void setTakeOver(bool on) {
     gEngine.params.takeOver.store(on ? 1 : 0);
     gTap.muteSources = on;
     if (gTap.running() && gTapState.load() != 1) { gTap.stop(); startTapAsync(); }
+}
+static std::string appSupportFile(const char* name);
+static void setListen(bool on) {
+    gListenOn.store(on);
+    if (FILE* f = fopen(appSupportFile("listen.txt").c_str(), "w")) { fprintf(f, "%d\n", on ? 1 : 0); fclose(f); }
+    if (on) { startTapAsync(); return; }
+    if (gTapState.load() == 1) return; // never touch a tap still being created (it stops itself below)
+    if (!gTap.running()) return;
+    gTapState.store(1);           // busy while coreaudiod tears the tap down
+    gTapStartT = glfwGetTime();
+    std::thread([] {
+        gTap.stop();
+        gTap.inputPeak.store(0);
+        gTapState.store(0);
+    }).detach();
+}
+static void loadListen() {
+    if (FILE* f = fopen(appSupportFile("listen.txt").c_str(), "r")) {
+        int v = 1;
+        if (fscanf(f, "%d", &v) == 1) gListenOn.store(v != 0);
+        fclose(f);
+    }
 }
 // ── CoreAudio never on the UI thread ──
 // Listing devices and reading a device's hardware volume can block for
@@ -1289,6 +1367,52 @@ static void keyboardLauncher() {
     }
 }
 
+#ifdef __APPLE__
+// MIDI on/off, remembered across launches (midi.txt): "in 0|1", "out 0|1",
+// then one "block <device name>" per controller AVA should ignore. Lets
+// Ableton (or any DAW) own the controllers + skip the AVA OS Octagon port.
+static void saveMidiPrefs() {
+    if (FILE* f = fopen(appSupportFile("midi.txt").c_str(), "w")) {
+        fprintf(f, "in %d\nout %d\n", gMidi.enabled() ? 1 : 0, gOutOn ? 1 : 0);
+        for (auto& n : gMidi.blocked()) fprintf(f, "block %s\n", n.c_str());
+        fclose(f);
+    }
+}
+static void loadMidiPrefs() {
+    FILE* f = fopen(appSupportFile("midi.txt").c_str(), "r");
+    if (!f) return;
+    char line[300];
+    while (fgets(line, sizeof(line), f)) {
+        std::string l(line);
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+        if (l.rfind("in ", 0) == 0) gMidi.setEnabled(l[3] != '0');
+        else if (l.rfind("out ", 0) == 0) gOutOn = l[4] != '0';
+        else if (l.rfind("block ", 0) == 0) gMidi.setBlocked(l.substr(6), true);
+    }
+    fclose(f);
+}
+// let go of everything MIDI is holding (input switched off mid-note)
+static void midiReleaseAll() {
+    gMidiSustain = false;
+    gEngine.params.fxStrobe.store(0);
+    gEngine.params.fxChoke.store(0);
+    for (int z = 0; z < NZONES; z++) {
+        bool had = gMidiHeldNote[z] >= 0 || gMidiSustained[z];
+        gMidiHeldNote[z] = -1;
+        gMidiSustained[z] = false;
+        if (had && !zoneHeldElsewhere(z)) gEngine.params.padGate[z].store(0);
+    }
+}
+// the octagon port: OFF removes "AVA OS Octagon" from the system entirely so
+// a DAW never sees it, ON publishes it again
+static void setMidiOut(bool on) {
+    if (gOutOn) outNoteOff();
+    gOutOn = on;
+    if (on && !gMidiOut.running()) gMidiOut.start();
+    if (!on && gMidiOut.running()) gMidiOut.stop();
+}
+#endif
+
 // drain MIDI, run the pad map, advance wave/pulse schedulers. Called once
 // per frame; all engine access is via atomics so this is thread-clean.
 static void processMidi(double now, float dt) {
@@ -1391,6 +1515,11 @@ static void processMidi(double now, float dt) {
             if (mapped) continue; // a learned knob overrides the stock CC map
             if (e.a == 1) { // mod wheel → tremolo depth, rate fixed 5.5 Hz
                 gEngine.params.fxTrem.store(e.b / 127.0f * 0.6f);
+            } else if (e.a == 74 || e.a == 71) { // SWEEP: 74 cutoff (brightness), 71 resonance
+                (e.a == 74 ? gEngine.params.sweepCutoff : gEngine.params.sweepReso).store(e.b / 127.0f);
+                // turning the cutoff while the filter is off picks it up as LP
+                if (e.a == 74 && gEngine.params.sweepMode.load() == 0) gEngine.params.sweepMode.store(1);
+                gSweepDirty = true;
             } else if (e.a == 7) { // master trim
                 gMasterVol = e.b / 127.0f;
                 gEngine.params.masterVolume.store(gMasterVol);
@@ -1847,11 +1976,47 @@ static void drawMidiBody() {
     if (gFontSmall) ImGui::PopFont();
 #ifdef __APPLE__
     {
+        bool en = gMidi.enabled();
         bool conn = gMidi.connected();
         bool flash = now - gMidiActFlashT < 0.12;
-        light(flash ? IM_COL32(255, 255, 255, 255) : conn ? IM_COL32(80, 220, 120, 200) : W(0.15f));
-        if (conn) ImGui::Text("%s", gMidi.deviceName().c_str());
+        light(flash && en ? IM_COL32(255, 255, 255, 255) : conn ? IM_COL32(80, 220, 120, 200) : W(0.15f));
+        ImGui::PushID("midiin");
+        if (en) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1, 1, 1, 0.28f));
+        if (ImGui::SmallButton(en ? "ON" : "OFF")) {
+            if (en) midiReleaseAll();
+            gMidi.setEnabled(!en);
+            saveMidiPrefs();
+        }
+        if (en) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("OFF = AVA ignores every MIDI controller\n(leave them to Ableton)");
+        ImGui::SameLine(0, 14);
+        if (!en) ImGui::TextDisabled("MIDI in off");
+        else if (conn) ImGui::Text("%s", gMidi.deviceName().c_str());
         else ImGui::TextDisabled("no controller");
+        // every device on the system, each with its own switch
+        auto srcs = gMidi.sources();
+        if (en && !srcs.empty()) {
+            ImGui::Dummy(ImVec2(0, 2));
+            for (int i = 0; i < (int)srcs.size(); i++) {
+                ImGui::PushID(i);
+                bool on = srcs[i].on;
+                if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1, 1, 1, 0.18f));
+                if (ImGui::SmallButton(on ? "ON " : "OFF")) {
+                    gMidi.setBlocked(srcs[i].name, on);
+                    if (on) midiReleaseAll();
+                    saveMidiPrefs();
+                }
+                if (on) ImGui::PopStyleColor();
+                ImGui::SameLine(0, 10);
+                if (gFontSmall) ImGui::PushFont(gFontSmall);
+                if (on) ImGui::Text("%s", srcs[i].name.c_str());
+                else ImGui::TextDisabled("%s", srcs[i].name.c_str());
+                if (gFontSmall) ImGui::PopFont();
+                ImGui::PopID();
+            }
+        }
+        ImGui::PopID();
     }
 #else
     ImGui::TextDisabled("macOS only in this build");
@@ -1882,7 +2047,7 @@ static void drawMidiBody() {
     bool portOk = false;
 #endif
     if (gFontSmall) ImGui::PushFont(gFontSmall);
-    ImGui::TextDisabled("OUT   ·   \"AVA OS Octagon\"%s", portOk ? "" : "   ·   port unavailable");
+    ImGui::TextDisabled("OUT   ·   \"AVA OS Octagon\"%s", portOk ? "" : gOutOn ? "   ·   port unavailable" : "   ·   off");
     if (gFontSmall) ImGui::PopFont();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("rings = octaves, slices = scale steps, rim = velocity, angle = bend, hold = pressure\nzone sliders CC 20-24 · orbs CC 40-44 · Intensity..Void CC 30-38 · master CC 7");
@@ -1894,10 +2059,16 @@ static void drawMidiBody() {
     bool litO = gOutOn;
     if (litO) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1, 1, 1, 0.28f));
     if (ImGui::SmallButton(gOutOn ? "ON" : "OFF")) {
-        if (gOutOn) outNoteOff();
+#ifdef __APPLE__
+        setMidiOut(!gOutOn);
+        saveMidiPrefs();
+#else
         gOutOn = !gOutOn;
+#endif
     }
     if (litO) ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("OFF removes the \"AVA OS Octagon\" port, so Ableton never sees it");
     ImGui::SameLine(0, 14);
     if (ImGui::SmallButton("-")) { outNoteOff(); gOutRoot = std::max(12, gOutRoot - 1); }
     ImGui::SameLine(0, 4);
@@ -2107,6 +2278,258 @@ static void loadLayerFx() {
     }
     fclose(f);
 }
+// SWEEP lives outside the presets too (sweep.txt: mode cutoff reso tilt)
+static void saveSweep() {
+    if (FILE* f = fopen(appSupportFile("sweep.txt").c_str(), "w")) {
+        fprintf(f, "%d %.3f %.3f %.3f\n", gEngine.params.sweepMode.load(), gEngine.params.sweepCutoff.load(),
+                gEngine.params.sweepReso.load(), gEngine.params.sweepTilt.load());
+        fclose(f);
+    }
+    gSweepDirty = false;
+}
+static void loadSweep() {
+    FILE* f = fopen(appSupportFile("sweep.txt").c_str(), "r");
+    if (!f) return;
+    int m; float c, r, t;
+    if (fscanf(f, "%d %f %f %f", &m, &c, &r, &t) == 4) {
+        gEngine.params.sweepMode.store(std::min(3, std::max(0, m)));
+        gEngine.params.sweepCutoff.store(std::min(1.0f, std::max(0.0f, c)));
+        gEngine.params.sweepReso.store(std::min(1.0f, std::max(0.0f, r)));
+        gEngine.params.sweepTilt.store(std::min(1.0f, std::max(-1.0f, t)));
+    }
+    fclose(f);
+}
+// mic effects live outside the presets too (micfx.txt)
+static void saveMicFx() {
+    auto& M = gOut.micFx;
+    if (FILE* f = fopen(appSupportFile("micfx.txt").c_str(), "w")) {
+        fprintf(f, "%.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %d ", M.lowCut.load(), M.comp.load(),
+                M.echoMix.load(), M.echoTime.load(), M.echoFb.load(), M.revMix.load(), M.revSize.load(),
+                M.bodyAmt.load(), M.bodySpeed.load(), M.bodyDir.load());
+        fprintf(f, "%.3f lvl %.3f hc %.3f\n", gIn.limitCeil.load(), gOut.micLevel.load(), M.wetCut.load());
+        fclose(f);
+    }
+}
+static void loadMicFx() {
+    FILE* f = fopen(appSupportFile("micfx.txt").c_str(), "r");
+    if (!f) return;
+    auto& M = gOut.micFx;
+    float v[9]; int d;
+    if (fscanf(f, "%f %f %f %f %f %f %f %f %f %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &d) == 10) {
+        std::atomic<float>* dst[9] = {&M.lowCut, &M.comp, &M.echoMix, &M.echoTime, &M.echoFb,
+                                      &M.revMix, &M.revSize, &M.bodyAmt, &M.bodySpeed};
+        for (int i = 0; i < 9; i++) dst[i]->store(std::min(1.0f, std::max(0.0f, v[i])));
+        M.bodyDir.store(d ? 1 : 0);
+        float c;
+        if (fscanf(f, "%f", &c) == 1) gIn.limitCeil.store(std::min(1.0f, std::max(0.25f, c)));
+        if (fscanf(f, " lvl %f", &c) == 1) gOut.micLevel.store(std::min(2.0f, std::max(0.0f, c)));
+        if (fscanf(f, " hc %f", &c) == 1) M.wetCut.store(std::min(1.0f, std::max(0.0f, c)));
+    }
+    fclose(f);
+}
+// under GAIN in the mic popup: LIMIT ceiling + how hard it's working, FIT,
+// and the one kind of clipping software can't undo (the interface preamp)
+static void drawInputLimit() {
+    float cdb = 20.0f * std::log10(gIn.limitCeil.load());
+    ImGui::TextDisabled("LIMIT"); ImGui::SameLine(0, 6);
+    ImGui::SetNextItemWidth(110);
+    if (ImGui::SliderFloat("##inlimit", &cdb, -12.0f, 0.0f, "%.0f dB")) gIn.limitCeil.store(std::pow(10.0f, cdb / 20.0f));
+    if (ImGui::IsItemDeactivatedAfterEdit()) saveMicFx();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("the loudest the mic can ever get: peaks above this are\n"
+                          "caught instantly instead of clipping. Lower = safer, flatter.");
+    ImGui::SameLine(0, 10);
+    float red = gIn.limitRed.load();
+    if (red > 0.5f) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "-%.0f dB", red);
+    else ImGui::TextDisabled("  ok  ");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("how much the limiter is holding back right now");
+    ImGui::SameLine(0, 10);
+    if (ImGui::SmallButton("FIT")) {
+        // loudest peak of the last few seconds lands at -6 dB
+        float hp = gIn.hotPeak.load();
+        if (hp > 0.002f) gIn.gain.store(std::min(8.0f, std::max(0.05f, gIn.gain.load() * 0.5f / hp)));
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("talk or play at your loudest for a few seconds, then\nclick: GAIN is set so that lands at -6 dB");
+    // two separate faders: the mic, and the music channels
+    {
+        auto fader = [](const char* label, const char* id, float v, float mx) {
+            char txt[24];
+            if (v < 0.001f) snprintf(txt, sizeof txt, "off");
+            else snprintf(txt, sizeof txt, "%+.0f dB", 20.0f * std::log10(v));
+            ImGui::TextDisabled("%s", label); ImGui::SameLine(64);
+            ImGui::SetNextItemWidth(170);
+            ImGui::SliderFloat(id, &v, 0.0f, mx, txt);
+            return v;
+        };
+        float ml = fader("MIC", "##miclvl", gOut.micLevel.load(), 2.0f);
+        if (ImGui::IsItemEdited()) gOut.micLevel.store(ml);
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) { gOut.micLevel.store(1.0f); saveMicFx(); }
+        if (ImGui::IsItemDeactivatedAfterEdit()) saveMicFx();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("mic level, heard and felt — the music is not touched\ndouble-click: 0 dB");
+        float mg = fader("MUSIC", "##musiclvl", gEngine.params.musicGain.load(), 1.5f);
+        if (ImGui::IsItemEdited()) gEngine.params.musicGain.store(mg);
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) gEngine.params.musicGain.store(1.0f);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(gTakeOver ? "the music channels' level (same as Settings > Music > Level)\ndouble-click: 0 dB"
+                                        : "AVA isn't playing the music while listening: your music\nplayer's own volume sets it (or switch to Take over)");
+    }
+    if (gIn.clipHold.load() > 0.0f) {
+        ImGui::TextColored(ImVec4(1, 0.45f, 0.35f, 1), "INTERFACE CLIPPING");
+        ImGui::TextDisabled("turn the GAIN knob on the interface down —\nit's distorting before AVA gets it");
+    }
+}
+// the effects section of the mic popup: HEAR (the input itself, heard and
+// felt) and FEEL (body echo on the zones)
+static void drawMicFxPopup() {
+    auto& M = gOut.micFx;
+    bool changed = false;
+    auto row = [&](const char* label, const char* id, std::atomic<float>& p, const char* fmt, float shown, const char* tip) {
+        ImGui::TextDisabled("%s", label); ImGui::SameLine(64);
+        float v = p.load();
+        char txt[32]; snprintf(txt, sizeof txt, fmt, shown);
+        ImGui::SetNextItemWidth(170);
+        if (ImGui::SliderFloat(id, &v, 0.0f, 1.0f, txt)) p.store(v);
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) { p.store(0.0f); changed = true; }
+        if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+    };
+    ImGui::Separator();
+    ImGui::TextDisabled("HEAR");
+    float lc = M.lowCut.load();
+    row("LOW CUT", "##mfx_lc", M.lowCut, lc > 0.001f ? "%.0f Hz" : "off", MicFx::lowCutHz(lc),
+        "removes rumble and handling noise below this\ndouble-click: off");
+    row("COMP", "##mfx_cp", M.comp, M.comp.load() > 0.001f ? "%.0f%%" : "off", M.comp.load() * 100,
+        "evens out whispers and loud voices\ndouble-click: off");
+    row("REVERB", "##mfx_rm", M.revMix, M.revMix.load() > 0.001f ? "%.0f%%" : "off", M.revMix.load() * 100,
+        "how much room you hear (and feel) around the voice\ndouble-click: off");
+    row("  size", "##mfx_rs", M.revSize, "%.1f s", MicFx::revSec(M.revSize.load()), "small room → long hall");
+    row("ECHO", "##mfx_em", M.echoMix, M.echoMix.load() > 0.001f ? "%.0f%%" : "off", M.echoMix.load() * 100,
+        "repeats bouncing left/right\ndouble-click: off");
+    row("  time", "##mfx_et", M.echoTime, "%.0f ms", MicFx::echoMs(M.echoTime.load()), "time between repeats");
+    row("  repeats", "##mfx_ef", M.echoFb, "%.0f%%", M.echoFb.load() * 100, "how long the echo keeps going");
+    row("HIGH CUT", "##mfx_hc", M.wetCut, "%.1f kHz", MicFx::wetCutHz(M.wetCut.load()) / 1000.0f,
+        "darkens the reverb and echo (your dry voice is untouched)\nleft = warm and dark, right = bright");
+    ImGui::Separator();
+    ImGui::TextDisabled("FEEL");
+    row("BODY ECHO", "##mfx_ba", M.bodyAmt, M.bodyAmt.load() > 0.001f ? "%.0f%%" : "off", M.bodyAmt.load() * 100,
+        "what the bed plays repeats zone by zone along the body\n(acts on everything the bed plays, not only the mic)\ndouble-click: off");
+    row("  speed", "##mfx_bs", M.bodySpeed, "%.0f ms/zone", MicFx::bodyMs(M.bodySpeed.load()), "time to travel to the next zone");
+    ImGui::TextDisabled("  way"); ImGui::SameLine(64);
+    int dir = M.bodyDir.load();
+    if (ImGui::RadioButton("head → feet", dir == 0)) { M.bodyDir.store(0); changed = true; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("feet → head", dir == 1)) { M.bodyDir.store(1); changed = true; }
+    if (changed) saveMicFx();
+}
+static float sweepHz(float v) { return 12.0f * std::pow(250.0f / 12.0f, v); }
+static float sweepQ(float v) { return 0.6f * std::pow(10.0f, v); }
+
+// SWEEP strip: mode chips · cutoff×resonance pad with the live response
+// curve · TILT along the body. Returns the height used.
+static float drawSweep(float x, float y, float w) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGuiIO& io = ImGui::GetIO();
+    auto& P = gEngine.params;
+    const int mode = P.sweepMode.load();
+    dl->AddText(ImVec2(x, y), W(mode ? 0.75f : 0.35f), "Sweep");
+    // mode chips, right of the label
+    static const char* kModes[4] = {"OFF", "LP", "BP", "HP"};
+    static const char* kTips[4] = {"filter bypassed", "low-pass: close it to keep only the deepest",
+                                   "band-pass: a resonant hot spot you move through the body",
+                                   "high-pass: thin the body out from the bottom"};
+    if (gFontSmall) ImGui::PushFont(gFontSmall);
+    float cx = x + 64;
+    for (int m = 0; m < 4; m++) {
+        ImVec2 ts = ImGui::CalcTextSize(kModes[m]);
+        float cw = ts.x + 16, ch = 18;
+        ImVec2 a(cx, y - 1), b(cx + cw, y - 1 + ch);
+        bool on = mode == m;
+        dl->AddRect(a, b, on ? LB(0.85f) : W(0.16f), 9.0f, 0, 1.0f);
+        if (on) dl->AddRectFilled(a, b, LB(0.14f), 9.0f);
+        dl->AddText(ImVec2(cx + 8, y + 8 - ts.y / 2), on ? LB(0.95f) : W(0.45f), kModes[m]);
+        ImGui::SetCursorScreenPos(a);
+        char id[16]; snprintf(id, sizeof id, "##swm%d", m);
+        if (ImGui::InvisibleButton(id, ImVec2(cw, ch))) { P.sweepMode.store(m); saveSweep(); }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kTips[m]);
+        cx += cw + 6;
+    }
+    char hz[48];
+    snprintf(hz, sizeof hz, "%.0f Hz  ·  Q %.1f", sweepHz(P.sweepCutoff.load()), sweepQ(P.sweepReso.load()));
+    ImVec2 hs = ImGui::CalcTextSize(hz);
+    dl->AddText(ImVec2(x + w - hs.x, y + 1), W(mode ? 0.55f : 0.25f), hz);
+
+    // pad: X = cutoff (12..250 Hz log), Y = resonance (up = more)
+    const float padY = y + 26, padH = 84;
+    const float x0 = x, x1 = x + w;
+    dl->AddRectFilled(ImVec2(x0, padY), ImVec2(x1, padY + padH), W(0.03f), 6.0f);
+    dl->AddRect(ImVec2(x0, padY), ImVec2(x1, padY + padH), W(0.08f), 6.0f);
+    // felt-band guides: rings 10-80, centre to 200
+    for (float g : {20.0f, 40.0f, 80.0f, 160.0f}) {
+        float gx = x0 + (x1 - x0) * std::log(g / 12.0f) / std::log(250.0f / 12.0f);
+        dl->AddLine(ImVec2(gx, padY + 4), ImVec2(gx, padY + padH - 4), W(0.05f), 1.0f);
+        char gl[8]; snprintf(gl, sizeof gl, "%.0f", g);
+        dl->AddText(ImVec2(gx + 3, padY + padH - 14), W(0.18f), gl);
+    }
+    // magnitude response (2nd order, same gain compensation as the engine)
+    {
+        const float fc = sweepHz(P.sweepCutoff.load()), q = sweepQ(P.sweepReso.load());
+        const float comp = (mode == 2) ? 1.0f : 1.0f / std::sqrt(std::max(1.0f, q));
+        const int N = 96;
+        ImVec2 pts[N];
+        for (int i = 0; i < N; i++) {
+            float t = i / (float)(N - 1);
+            float f = 12.0f * std::pow(250.0f / 12.0f, t), r = f / fc;
+            float den = std::sqrt((1 - r * r) * (1 - r * r) + (r / q) * (r / q));
+            float mag = mode == 0 ? 1.0f : mode == 1 ? comp / den : mode == 2 ? (r / q) / den : comp * r * r / den;
+            float db = 20.0f * std::log10(std::max(mag, 1e-4f));          // -30 .. +12 dB
+            float yy = padY + padH - 6 - (padH - 12) * (std::min(12.0f, std::max(-30.0f, db)) + 30.0f) / 42.0f;
+            pts[i] = ImVec2(x0 + (x1 - x0) * t, yy);
+        }
+        dl->AddPolyline(pts, N, mode ? LB(0.18f) : W(0.06f), 0, 4.0f);
+        dl->AddPolyline(pts, N, mode ? LB(0.85f) : W(0.18f), 0, 1.4f);
+    }
+    float hx = x0 + (x1 - x0) * P.sweepCutoff.load();
+    float hy = padY + padH - 8 - (padH - 16) * P.sweepReso.load();
+    dl->AddCircleFilled(ImVec2(hx, hy), 6.0f, mode ? W(0.95f) : W(0.35f));
+    ImGui::SetCursorScreenPos(ImVec2(x0, padY));
+    ImGui::InvisibleButton("##swpad", ImVec2(x1 - x0, padH));
+    if (ImGui::IsItemActive()) {
+        P.sweepCutoff.store(std::max(0.0f, std::min(1.0f, (io.MousePos.x - x0) / (x1 - x0))));
+        P.sweepReso.store(std::max(0.0f, std::min(1.0f, (padY + padH - 8 - io.MousePos.y) / (padH - 16))));
+        if (P.sweepMode.load() == 0) P.sweepMode.store(1);   // grabbing the pad wakes it as LP
+    }
+    if (ImGui::IsItemDeactivated()) saveSweep();
+    if (ImGui::IsItemHovered() && !ImGui::IsItemActive())
+        ImGui::SetTooltip("drag: left/right = cutoff, up = resonance\nMIDI CC 74 cutoff · CC 71 resonance");
+
+    // TILT: -1 feet open first .. +1 head opens first; double-click centres
+    const float ty = padY + padH + 14;
+    dl->AddText(ImVec2(x0, ty - 6), W(0.35f), "TILT");
+    const float sx0 = x0 + 44, sx1 = x1 - 44;
+    float tv = P.sweepTilt.load();
+    float mx = (sx0 + sx1) * 0.5f, kx = mx + (sx1 - sx0) * 0.5f * tv;
+    dl->AddRectFilled(ImVec2(sx0, ty - 1.5f), ImVec2(sx1, ty + 1.5f), W(0.10f), 2);
+    dl->AddRectFilled(ImVec2(std::min(mx, kx), ty - 1.5f), ImVec2(std::max(mx, kx), ty + 1.5f), W(0.6f), 2);
+    dl->AddLine(ImVec2(mx, ty - 5), ImVec2(mx, ty + 5), W(0.25f), 1.0f);
+    dl->AddCircleFilled(ImVec2(kx, ty), 5.5f, W(0.95f));
+    dl->AddText(ImVec2(sx0, ty + 6), W(0.22f), "feet");
+    ImVec2 hs2 = ImGui::CalcTextSize("head");
+    dl->AddText(ImVec2(sx1 - hs2.x, ty + 6), W(0.22f), "head");
+    ImGui::SetCursorScreenPos(ImVec2(sx0 - 6, ty - 9));
+    ImGui::InvisibleButton("##swtilt", ImVec2(sx1 - sx0 + 12, 18));
+    if (ImGui::IsItemActive())
+        P.sweepTilt.store(std::max(-1.0f, std::min(1.0f, (io.MousePos.x - mx) / ((sx1 - sx0) * 0.5f))));
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) P.sweepTilt.store(0.0f);
+    if (ImGui::IsItemDeactivated() || (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0))) saveSweep();
+    if (ImGui::IsItemHovered() && !ImGui::IsItemActive())
+        ImGui::SetTooltip("offsets the cutoff along the body (±1.5 oct)\nright = head opens first, left = feet first\ndouble-click to centre");
+    if (gFontSmall) ImGui::PopFont();
+    // MIDI moved it: write at most twice a second while a knob is turning
+    static double lastSave = 0;
+    if (gSweepDirty && ImGui::GetTime() - lastSave > 0.5) { saveSweep(); lastSave = ImGui::GetTime(); }
+    return ty + 24 - y;
+}
+
 static bool layerFxActive(int z) {
     return gEngine.params.zoneTone[z].load() < 0.995f || gEngine.params.zoneDrive[z].load() > 0.001f ||
            gEngine.params.zonePulse[z].load() > 0.001f;
@@ -2627,6 +3050,7 @@ static void drawWaveBody(float w, bool audio = false) {
             gEngine.params.uplift.store(bal);
             gEngine.params.grounding.store(1.0f - bal);
             y = paramsY + 2 * rowH + 16;
+            y += drawSweep(px, y + 6, pw) + 10;
         }
     }
     ImGui::SetCursorScreenPos(ImVec2(o.x, y));
@@ -3569,7 +3993,9 @@ int main(int argc, char** argv) {
             std::string cand = std::string(dirname(exe)) + "/../Resources/Coolvetica.ttf";
             struct stat st{};
             if (stat(cand.c_str(), &st) == 0) fontPath = cand;
-            else if (stat("/Users/lu/soundtemple-os/assets/Coolvetica.ttf", &st) == 0) fontPath = "/Users/lu/soundtemple-os/assets/Coolvetica.ttf";
+#ifdef AVA_ASSETS_DIR
+            else if (stat(AVA_ASSETS_DIR "/Coolvetica.ttf", &st) == 0) fontPath = AVA_ASSETS_DIR "/Coolvetica.ttf";
+#endif
         }
 #endif
     }
@@ -3629,6 +4055,9 @@ int main(int argc, char** argv) {
             if (def && gDevices[i].id == def) { gSelDevice = i; break; }
     }
     if (gSelDevice < 0 && !gDevices.empty()) gSelDevice = 0;
+    if (const char* o = getenv("AVA_OUT"))   // automation: output device by name
+        for (int i = 0; i < (int)gDevices.size(); i++)
+            if (gDevices[i].name.find(o) != std::string::npos) { gSelDevice = i; break; }
     applyPreset(kTabPreset[0]);
     // screenshot / automation hooks: start on a given mode + artifact sub-tab
     if (const char* m = getenv("AVA_MODE")) gMode = std::min(std::max(atoi(m), 0), 2);
@@ -3648,16 +4077,25 @@ int main(int argc, char** argv) {
         bool ifaceIsDefault = iface && defaultOutputDevice() == gDevices[gSelDevice].id;
         setTakeOver(iface && !ifaceIsDefault);
     }
+    loadListen();
     startTapAsync();
     startAudio(); // live on launch
+    if (const char* m = getenv("AVA_MIC")) {   // automation: mic on (a name picks that input)
+        for (auto& d : listInputDevices()) if (d.name.find(m) != std::string::npos) { gMicDevId = d.id; break; }
+        setMic(true);
+    }
 #ifdef __APPLE__
+    loadMidiPrefs(); // MIDI in/out switches + ignored devices (before connecting)
     gMidi.start(); // any pad controller auto-connects (2 s hot-plug rescan)
-    gMidiOut.start(); // publish the "AVA OS Octagon" virtual MIDI source
+    if (gOutOn) gMidiOut.start(); // publish the "AVA OS Octagon" virtual MIDI source
 #endif
     for (auto& row : gOutCcLast) for (int& v : row) v = -1;
     loadTunerState();
     loadDeletedShaders();
     loadLayerFx();
+    loadSweep();
+    loadMicFx();
+    loadMicChoice();
 
     // shader background library — bundled copy first, dev checkout as fallback
     gShaders.loadLibrary(shaderLibraryDir());
@@ -3886,6 +4324,19 @@ int main(int argc, char** argv) {
                 }
 
                 // ── CHANNELS: what leaves the interface on each output ──
+                // ── LISTEN: hear the Mac's music, or just be an instrument ──
+                head("LISTEN");
+                {
+                    bool on = gListenOn.load();
+                    if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1, 1, 1, 0.28f));
+                    if (ImGui::SmallButton(on ? "ON##listen" : "OFF##listen")) setListen(!on);
+                    if (on) ImGui::PopStyleColor();
+                    ImGui::SameLine(0, 14);
+                    if (on) ImGui::TextDisabled("following the music playing on this Mac");
+                    else ImGui::TextDisabled("not listening  ·  pads, MIDI and effects play on their own");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("OFF: AVA stops capturing system audio (Ableton etc.)\nso you can play effects on top without the bed reacting to it");
+                }
                 head("CHANNELS");
                 int nch = gOut.running()
                               ? gOut.activeChannels
@@ -4317,6 +4768,8 @@ int main(int argc, char** argv) {
                             } else if (clip) {
                                 ImGui::SameLine(0, 10);
                                 ImGui::TextColored(ImVec4(1, 0.45f, 0.35f, 1), "CLIP");
+                                if (ImGui::IsItemHovered())
+                                    ImGui::SetTooltip("the interface itself is at full scale: turn its\ninput gain knob down (software can't undo this)");
                             }
                         }
                         bool hear = gOut.inToSpeakers.load();
@@ -4361,6 +4814,92 @@ int main(int argc, char** argv) {
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("stop the bed and everything sounding on it");
             dl->AddRectFilled(ImVec2(bx + 29, by - 6), ImVec2(bx + 41, by + 6), W(ImGui::IsItemHovered() ? 0.9f : 0.6f), 2);
 
+            // MIC: click = talk into a mic and hear it, right-click = which mic + gain
+            {
+                ImVec2 mc(bx + 78, by);
+                ImGui::SetCursorScreenPos(ImVec2(mc.x - 14, by - 14));
+                if (ImGui::InvisibleButton("##mic", ImVec2(28, 28))) setMic(!gMicOn);
+                bool h = ImGui::IsItemHovered();
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) ImGui::OpenPopup("##micpop");
+                bool live = gMicOn && gIn.running();
+                if (h) {
+                    if (!gMicOn) ImGui::SetTooltip("mic: talk and hear yourself (the arrow picks the mic)");
+                    else if (live) ImGui::SetTooltip("mic on: %s\nclick to turn off, right-click for mic + gain", gInDevName.c_str());
+                    else ImGui::SetTooltip("mic: %s", micAuthStatus() == 1 ? "blocked by macOS, right-click to fix"
+                                                      : gIn.lastError.empty() ? "starting" : gIn.lastError.c_str());
+                }
+                ImU32 bg = gMicOn ? W(0.92f) : W(h ? 0.14f : 0.0f);
+                ImU32 fg = gMicOn ? IM_COL32(10, 10, 10, 255) : W(h ? 0.95f : 0.6f);
+                if (live) {
+                    // the level as a ring around the button
+                    float pk = std::min(1.0f, gIn.peak.load() * 1.6f);
+                    if (pk > 0.01f) dl->AddCircle(mc, 14 + 4 * pk, gIn.peak.load() > 0.98f
+                                                      ? IM_COL32(255, 120, 90, 220) : IM_COL32(140, 235, 255, (int)(90 + 140 * pk)), 32, 2.0f);
+                } else if (gMicOn) dl->AddCircle(mc, 15, IM_COL32(255, 190, 80, 220), 32, 1.5f);
+                dl->AddCircleFilled(mc, 13, bg, 32);
+                // capsule, cradle, stand
+                dl->AddRectFilled(ImVec2(mc.x - 3, mc.y - 8), ImVec2(mc.x + 3, mc.y + 2), fg, 3);
+                dl->PathArcTo(ImVec2(mc.x, mc.y - 1), 6, 0.0f, dsp::kPi, 16);
+                dl->PathStroke(fg, 0, 1.5f);
+                dl->AddLine(ImVec2(mc.x, mc.y + 5), ImVec2(mc.x, mc.y + 8), fg, 1.5f);
+                dl->AddLine(ImVec2(mc.x - 3.5f, mc.y + 8.5f), ImVec2(mc.x + 3.5f, mc.y + 8.5f), fg, 1.5f);
+                // caret: which mic, without knowing about right-click
+                ImGui::SetCursorScreenPos(ImVec2(mc.x + 15, by - 12));
+                if (ImGui::InvisibleButton("##micpick", ImVec2(14, 24))) ImGui::OpenPopup("##micpop");
+                bool ch = ImGui::IsItemHovered();
+                if (ch) ImGui::SetTooltip("pick the mic");
+                const float cx = mc.x + 22;
+                dl->AddTriangleFilled(ImVec2(cx - 3.5f, by - 1.5f), ImVec2(cx + 3.5f, by - 1.5f), ImVec2(cx, by + 2.5f), W(ch ? 0.95f : 0.5f));
+
+                if (ImGui::BeginPopup("##micpop")) {
+                    ImGui::TextDisabled("MIC");
+                    static std::vector<OutDevice> mics; static double scanT = -10;
+                    if (ImGui::GetTime() - scanT > 2.0) { scanT = ImGui::GetTime(); mics = listInputDevices(); }
+                    if (ImGui::Selectable("Automatic  ·  the mic you plugged in", gMicDevId == 0 && gMicName.empty(), ImGuiSelectableFlags_DontClosePopups)) {
+                        gMicDevId = 0; gMicName.clear(); saveMicChoice();
+                        if (gMicOn) { gInDevId = pickMic(); setInput(true); }
+                    }
+                    for (auto& d : mics) {
+                        if (d.micRank == 0) continue;   // virtual devices are not mics
+                        bool cur = gMicOn ? d.id == gInDevId : (d.id == gMicDevId || (!gMicDevId && d.name == gMicName));
+                        if (ImGui::Selectable(d.name.c_str(), cur, ImGuiSelectableFlags_DontClosePopups)) {
+                            gMicDevId = d.id; gMicName = d.name; saveMicChoice();
+                            if (gMicOn) { gInDevId = d.id; setInput(true); } else setMic(true);
+                        }
+                    }
+                    ImGui::Separator();
+                    bool on = gMicOn;
+                    if (ImGui::Checkbox("Mic on", &on)) setMic(on);
+                    if (gMicOn) {
+                        int auth = micAuthStatus();
+                        if (auth == 1) {
+                            ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "microphone blocked by macOS");
+                            if (ImGui::SmallButton("Open Privacy settings"))
+                                system("open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone' &");
+                        } else if (gIn.running()) {
+                            ImGui::TextDisabled("GAIN"); ImGui::SameLine(0, 6);
+                            float g = gIn.gain.load();
+                            ImGui::SetNextItemWidth(160);
+                            if (ImGui::SliderFloat("##micgain", &g, 0.0f, 8.0f, "%.1fx")) gIn.gain.store(g);
+                            ImGui::TextDisabled("LEVEL"); ImGui::SameLine(0, 6);
+                            float pk = gIn.peak.load();
+                            ImVec2 mp = ImGui::GetCursorScreenPos();
+                            ImDrawList* pdl = ImGui::GetWindowDrawList();
+                            const float mw = 160, mh = 8, my = mp.y + (ImGui::GetFrameHeight() - mh) / 2;
+                            pdl->AddRectFilled(ImVec2(mp.x, my), ImVec2(mp.x + mw, my + mh), IM_COL32(255, 255, 255, 18), 3);
+                            if (pk > 0.003f)
+                                pdl->AddRectFilled(ImVec2(mp.x, my), ImVec2(mp.x + mw * std::min(1.0f, pk), my + mh),
+                                                   pk > 0.98f ? IM_COL32(255, 120, 90, 255) : IM_COL32(140, 235, 255, 230), 3);
+                            ImGui::Dummy(ImVec2(mw, ImGui::GetFrameHeight()));
+                            drawInputLimit();
+                        } else ImGui::TextColored(ImVec4(1, 0.75f, 0.3f, 1), "%s", gIn.lastError.empty() ? "not running" : gIn.lastError.c_str());
+                        ImGui::TextDisabled("use headphones: a mic near speakers feeds back");
+                    }
+                    drawMicFxPopup();
+                    ImGui::EndPopup();
+                }
+            }
+
             // mini window toggle at the pill's right end
             ImGui::SetCursorScreenPos(ImVec2(p1.x - 58, by - 11));
             if (ImGui::InvisibleButton("##mini", ImVec2(44, 22))) setMini(win, true);
@@ -4378,7 +4917,7 @@ int main(int argc, char** argv) {
                 if (h) ImGui::SetTooltip("mini: float a small octagon over your other apps");
             }
             // volume slider
-            float sx0 = bx + 66, sx1 = p1.x - 110, sy = by;
+            float sx0 = bx + 122, sx1 = p1.x - 110, sy = by;
             dl->AddRectFilled(ImVec2(sx0, sy - 2), ImVec2(sx1, sy + 2), W(0.14f), 2);
             dl->AddRectFilled(ImVec2(sx0, sy - 2), ImVec2(sx0 + (sx1 - sx0) * gMasterVol, sy + 2), W(0.9f), 2);
             dl->AddCircleFilled(ImVec2(sx0 + (sx1 - sx0) * gMasterVol, sy), 9, W(0.97f));
@@ -4563,7 +5102,7 @@ int main(int argc, char** argv) {
                 if (trim < 0.99f || clip) {
                     char tag[40];
                     if (trim < 0.99f) snprintf(tag, sizeof tag, "IN GUARD %.0f dB", 20.0f * log10f(trim));
-                    else snprintf(tag, sizeof tag, "IN CLIP");
+                    else snprintf(tag, sizeof tag, "INTERFACE CLIP");
                     if (gFontSmall) ImGui::PushFont(gFontSmall);
                     ImVec2 ts = ImGui::CalcTextSize(tag);
                     dl->AddText(ImVec2(leftW - 330 - ts.x, 42 - ts.y / 2), IM_COL32(255, 140, 80, 255), tag);
@@ -4579,7 +5118,8 @@ int main(int argc, char** argv) {
                 ImGui::SetCursorScreenPos(ImVec2(dp.x - 10, dp.y - 10));
                 if (ImGui::InvisibleButton("##sigdot", ImVec2(20, 20))) gShowDeviceNames = !gShowDeviceNames;
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip(signal ? "hearing your music  ·  click for the devices"
+                    ImGui::SetTooltip(!gListenOn.load() ? "not listening (Settings > LISTEN)  ·  click for the devices"
+                                      : signal ? "hearing your music  ·  click for the devices"
                                       : gTapState.load() == 1 ? "waiting for the Mac's audio system"
                                       : "no music playing on this Mac  ·  click for the devices");
             }

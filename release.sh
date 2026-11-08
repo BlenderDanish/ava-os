@@ -15,7 +15,7 @@ sed -i '' "s|<key>CFBundleShortVersionString</key><string>[^<]*</string>|<key>CF
 echo "── build $VER ──"; cmake --build "$MAC" -j8 | tail -1; cmake --build build-win -j8 | tail -1
 echo "── package ──"; STAGE=$(mktemp -d); mkdir -p "$STAGE/s"; cp -R "$MAC/AVA OS.app" "$STAGE/s/"
 lipo -archs "$STAGE/s/AVA OS.app/Contents/MacOS/AVA OS" | grep -q x86_64 || { echo "not universal"; exit 1; }
-codesign --force --deep --sign - --identifier nyc.soundtemple.os --options runtime "$STAGE/s/AVA OS.app"
+codesign --force --deep --sign - --identifier com.avartifacts.os --options runtime "$STAGE/s/AVA OS.app"
 ln -s /Applications "$STAGE/s/Applications"; mkdir -p dist
 hdiutil create -volname "AVA OS" -srcfolder "$STAGE/s" -ov -quiet -format UDZO -fs HFS+ "dist/AVA-OS-$VER-macOS-universal.dmg"
 ./package-win.sh | tail -1; cp dist/AVA-OS-Windows.zip "dist/AVA-OS-$VER-Windows-x64.zip"

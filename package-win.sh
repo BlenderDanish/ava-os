@@ -24,7 +24,7 @@ du -sh "$OUT/shaders"
 cat > "$OUT/README.txt" <<'EOF'
 AVA OS — WINDOWS
 ========================
-Live vibroacoustic engine for the SoundTemple. Listens to whatever your PC is
+Live vibroacoustic engine for the AVA bed. Listens to whatever your PC is
 playing and generates five vibration zone channels (Head / Heart / Belly /
 Butt / Feet) in real time, plus the stereo music feed. The octagon is also a
 playable pad controller with a voice library (PURE / WHALE / QUAKE / HEART /

@@ -68,7 +68,8 @@ if(APPLE)
     src/midi_in.mm
     src/midi_out.mm
     src/mac_fullscreen.mm)
-  target_compile_definitions(AVAOS PRIVATE GL_SILENCE_DEPRECATION)
+  target_compile_definitions(AVAOS PRIVATE GL_SILENCE_DEPRECATION
+    AVA_ASSETS_DIR="${CMAKE_SOURCE_DIR}/assets")
   target_link_libraries(AVAOS PRIVATE imgui_lib
     "-framework CoreAudio"
     "-framework AVFoundation"
@@ -85,7 +86,7 @@ if(APPLE)
     OUTPUT_NAME "AVA OS"
     MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/Info.plist.in
     MACOSX_BUNDLE_BUNDLE_NAME "AVA OS"
-    MACOSX_BUNDLE_GUI_IDENTIFIER "nyc.soundtemple.os")
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.avartifacts.os")
   # shader library rides inside the bundle (Contents/Resources/shaders)
   add_custom_command(TARGET AVAOS POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
