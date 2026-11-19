@@ -329,3 +329,4 @@ void BedInput::stop() {
 // left to the OS (the HEALTH panel simply hides the MAX HW control)
 float deviceHwVolume(unsigned) { return -1.0f; }
 bool maxDeviceHwVolume(unsigned) { return false; }
+bool setDeviceRate(unsigned, double) { return true; }

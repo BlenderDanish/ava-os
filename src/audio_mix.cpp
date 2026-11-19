@@ -12,6 +12,7 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
                     float* const* vib, const float* const* vibR, float* dst, int n, int ch) {
     float vol = eng->params.masterVolume.load();
     bool monitor = eng->params.monitorVibOnStereo.load() != 0;
+    const bool transducer = eng->params.transducerOnStereo.load() != 0;
     // AVA plays the music only when it has taken it over (muted tap); in
     // listen mode the music is already coming out of the speakers untouched
     // (an authored stem set brings its own music track: that always plays)
@@ -29,6 +30,7 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
     int musicL = eng->params.musicChanL.load();
     float musicG = eng->params.musicGain.load();
     int surrL = eng->params.surrChanL.load();
+    const int monoMask = eng->params.monoMask.load();
     float surrG = eng->params.surrGain.load();
     float surrW = eng->params.surrWidth.load();
     int zc[NZONES], zc2[NZONES];
@@ -56,7 +58,14 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
     };
 
     std::memset(dst, 0, (size_t)n * ch * sizeof(float));
-    if (ch <= 2) {
+    // a ring or mono speaker routed onto a stereo device's own channels (an
+    // amp + transducer on the headphone jack) makes it a real bed output:
+    // routing, trims, solo, TEST and PING apply as on an interface
+    bool routedHere = false;
+    for (int z = 0; z < NZONES; z++)
+        routedHere |= (zc[z] >= 0 && zc[z] < ch) || (zc2[z] >= 0 && zc2[z] < ch);
+    routedHere |= (monoMask & ((1 << std::min(ch, 31)) - 1)) != 0;
+    if (ch <= 2 && !routedHere) {
         // Plain stereo device (laptop, headphones, a DJ's built-in output):
         // this is what every download runs on. When the tap has muted the
         // source apps we ARE the speakers, so the music passes through at
@@ -70,6 +79,11 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
             // the harmonics (80-240 Hz) carry the same rhythm where you can hear it
             float m = 0.5f * (vib[HEART][i] + vib[BELLY][i] + vib[ROOT][i] + vib[FEET][i]);
             float v = monitor ? vibG * 0.8f * std::tanh(2.2f * m) : 0.0f;
+            if (transducer) {   // an amp + transducer on this output: the whole bed, clean, with trims and solo
+                v = 0.0f;
+                for (int z = 0; z < NZONES; z++) v += zt[z] * vib[z][i];
+                v *= vibG;
+            }
             dst[i * ch] = vol * (mg * L[i] + v);
             if (ch > 1) dst[i * ch + 1] = vol * (mg * R[i] + v);
             // the mic as heard follows the master like everything else
@@ -100,11 +114,17 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
             f[musicL] += vol * monL[i];
             if (musicL + 1 < ch) f[musicL + 1] += vol * monR[i];
         }
-        if (takeOver && musicL >= 0 && musicL < ch) {
+        // listening: the Mac already plays on ch 1-2 itself; a music pair moved
+        // anywhere else (speakers on another output) gets AVA's copy
+        if ((takeOver || musicL > 0) && musicL >= 0 && musicL < ch) {
             f[musicL] += vol * musicG * L[i];
             if (musicL + 1 < ch) f[musicL + 1] += vol * musicG * R[i];
         }
-        if (takeOver && surrL >= 0 && surrL < ch) {
+        if (monoMask) {   // single speakers (a TS cable in a headphone jack): music summed to mono
+            float mono = vol * musicG * 0.5f * (L[i] + R[i]);
+            for (int c = 0; c < ch && c < 32; c++) if (monoMask & (1 << c)) f[c] += mono;
+        }
+        if (surrL >= 0 && surrL < ch) {   // AVA-only pair: plays while listening too
             // mid/side width control: 0 = mono fill, 1 = full stereo image
             float mid = 0.5f * (L[i] + R[i]);
             float side = 0.5f * (L[i] - R[i]) * surrW;

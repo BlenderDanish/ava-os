@@ -39,6 +39,9 @@ float deviceHwVolume(unsigned deviceID);
 // push every settable output volume scalar to 1.0 and unmute all elements;
 // returns true if the device exposed anything settable
 bool maxDeviceHwVolume(unsigned deviceID);
+// ask the device to run at `hz` (the engine and the system tap are 48 kHz;
+// a 44.1k interface starves the tap ring → grainy sound). True if it now runs at hz.
+bool setDeviceRate(unsigned deviceID, double hz);
 
 class OutputUnit {
 public:

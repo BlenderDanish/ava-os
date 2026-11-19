@@ -211,6 +211,7 @@ static double gTapStartT = 0;
 // dot, the bed doesn't follow whatever Ableton is playing. Pads, MIDI, VFX and
 // the effects still play on their own (on silence). Remembered (listen.txt).
 static std::atomic<bool> gListenOn{true};
+static int gRouteEditCh = 0;   // Settings > CHANNELS row whose routing popup is open
 static void startTapAsync() {
     if (!gListenOn.load()) return;
     if (gTapState.load() == 1 || gTap.running()) return;
@@ -357,6 +358,68 @@ static void setListen(bool on) {
         gTapState.store(0);
     }).detach();
 }
+// ── output routing: which device channel carries what (routing.txt) ──
+static void saveRouting() {
+    if (FILE* f = fopen(appSupportFile("routing.txt").c_str(), "w")) {
+        fprintf(f, "%d %d", gEngine.params.musicChanL.load(), gEngine.params.surrChanL.load());
+        for (int z = 0; z < NZONES; z++) fprintf(f, " %d %d", gEngine.params.zoneChan[z].load(), gEngine.params.zoneChan2[z].load());
+        fprintf(f, " %d", gEngine.params.monoMask.load());
+        fprintf(f, "\n"); fclose(f);
+    }
+}
+static void loadRouting() {
+    FILE* f = fopen(appSupportFile("routing.txt").c_str(), "r");
+    if (!f) return;
+    int m, sr, zc[NZONES], z2[NZONES];
+    bool ok = fscanf(f, "%d %d", &m, &sr) == 2;
+    for (int z = 0; ok && z < NZONES; z++) ok = fscanf(f, "%d %d", &zc[z], &z2[z]) == 2;
+    int mono = 0;
+    if (ok && fscanf(f, "%d", &mono) != 1) mono = 0;   // older files: no mono field
+    fclose(f);
+    if (!ok) return;
+    gEngine.params.monoMask.store(mono);
+    gEngine.params.musicChanL.store(m); gEngine.params.surrChanL.store(sr);
+    for (int z = 0; z < NZONES; z++) { gEngine.params.zoneChan[z].store(zc[z]); gEngine.params.zoneChan2[z].store(z2[z]); }
+}
+// give device channel c one job (pairs take c and c+1); whatever used those
+// channels before lets go of them
+static void routeChannel(int c, int role, int nch) {
+    auto& P = gEngine.params;
+    auto freeCh = [&](int x) {
+        int m = P.musicChanL.load(), sr = P.surrChanL.load();
+        if (m >= 0 && (x == m || x == m + 1)) P.musicChanL.store(-1);
+        if (sr >= 0 && (x == sr || x == sr + 1)) P.surrChanL.store(-1);
+        if (x >= 0 && x < 32) P.monoMask.store(P.monoMask.load() & ~(1 << x));
+        for (int z = 0; z < NZONES; z++) {
+            if (P.zoneChan[z].load() == x) { P.zoneChan[z].store(P.zoneChan2[z].load()); P.zoneChan2[z].store(-1); }
+            if (P.zoneChan2[z].load() == x) P.zoneChan2[z].store(-1);
+        }
+    };
+    if (role == -2 || role == -3) {             // -2 music/speakers pair, -3 surround pair
+        int L = std::min(c, std::max(0, nch - 2));
+        freeCh(L); freeCh(L + 1);
+        (role == -2 ? P.musicChanL : P.surrChanL).store(L);
+    } else if (role >= 0 && role < NZONES) {    // a ring: moves here (its 2nd send stays)
+        freeCh(c);
+        P.zoneChan[role].store(c);
+    } else if (role == -4) {                    // mono speaker on this one channel
+        freeCh(c);
+        if (c >= 0 && c < 32) P.monoMask.store(P.monoMask.load() | (1 << c));
+    } else freeCh(c);                           // -1 nothing
+    saveRouting();
+}
+// a transducer amp on a plain stereo output (headphone jack), remembered (stereo_bed.txt)
+static void setTransducerOnStereo(bool on) {
+    gEngine.params.transducerOnStereo.store(on ? 1 : 0);
+    if (FILE* f = fopen(appSupportFile("stereo_bed.txt").c_str(), "w")) { fprintf(f, "%d\n", on ? 1 : 0); fclose(f); }
+}
+static void loadTransducerOnStereo() {
+    if (FILE* f = fopen(appSupportFile("stereo_bed.txt").c_str(), "r")) {
+        int v = 0;
+        if (fscanf(f, "%d", &v) == 1) gEngine.params.transducerOnStereo.store(v != 0);
+        fclose(f);
+    }
+}
 static void loadListen() {
     if (FILE* f = fopen(appSupportFile("listen.txt").c_str(), "r")) {
         int v = 1;
@@ -404,6 +467,8 @@ static void restartAudioAsync() {
     }).detach();
 }
 static void startAudio() {
+    // engine + tap are 48 kHz; a 44.1k interface starves the tap → grainy
+    if (gSelDevice >= 0 && gSelDevice < (int)gDevices.size()) setDeviceRate(gDevices[gSelDevice].id, 48000.0);
     if (!gTap.running()) startTapAsync();
     if (!gOut.running() && gSelDevice >= 0 && gSelDevice < (int)gDevices.size())
         gOut.start(gDevices[gSelDevice].id, &gEngine, &gRing);
@@ -4078,6 +4143,8 @@ int main(int argc, char** argv) {
         setTakeOver(iface && !ifaceIsDefault);
     }
     loadListen();
+    loadRouting();
+    loadTransducerOnStereo();
     startTapAsync();
     startAudio(); // live on launch
     if (const char* m = getenv("AVA_MIC")) {   // automation: mic on (a name picks that input)
@@ -4309,6 +4376,13 @@ int main(int argc, char** argv) {
                         ImGui::TextDisabled(to ? "speaker" : "listening");
                         if (gFontSmall) ImGui::PopFont();
                     }
+                    if (devOk && gDevices[gSelDevice].channels <= 2) {
+                        bool tr = gEngine.params.transducerOnStereo.load() != 0;
+                        if (ImGui::Checkbox("A transducer is on this output", &tr)) setTransducerOnStereo(tr);
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("An amp + transducer on a headphone jack or other stereo output:\n"
+                                              "every ring plays through it (keys, pads, the bed), with the ring trims and solo.");
+                    }
                     if (ImGui::SmallButton("Max every level")) maxAllLevels();
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("master, music, surround, every ring trim and the interface knob to full");
                     ImGui::SameLine();
@@ -4355,6 +4429,7 @@ int main(int argc, char** argv) {
                     if (musicL >= 0 && c == musicL + 1) app("MUSIC R");
                     if (surrL >= 0 && c == surrL) app("SURR L");
                     if (surrL >= 0 && c == surrL + 1) app("SURR R");
+                    if (c < 32 && (gEngine.params.monoMask.load() & (1 << c))) app("MONO SPEAKER");
                     for (int z = 0; z < NZONES; z++)
                         if (gEngine.params.zoneChan[z].load() == c ||
                             gEngine.params.zoneChan2[z].load() == c) app(kZoneNames[z]);
@@ -4370,9 +4445,15 @@ int main(int argc, char** argv) {
                     ImGui::SameLine();
                     ImGui::Text("Ch %-2d", c + 1);
                     ImGui::SameLine(78);
-                    ImGui::TextColored(assigned ? ImVec4(1, 1, 1, 0.9f)
-                                                : ImVec4(1, 1, 1, 0.3f),
-                                       "%s", assigned ? lbl : "—");
+                    {
+                        char sid[96];
+                        snprintf(sid, sizeof(sid), "%s  \xe2\x96\xbe##route%d", assigned ? lbl : "\xe2\x80\x94", c);
+                        ImGui::PushStyleColor(ImGuiCol_Text, assigned ? ImVec4(1, 1, 1, 0.9f) : ImVec4(1, 1, 1, 0.3f));
+                        if (ImGui::Selectable(sid, false, 0, ImVec2(112, 0))) ImGui::OpenPopup("##routepop");
+                        ImGui::PopStyleColor();
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click to choose what Ch %d plays", c + 1);
+                        if (ImGui::IsItemClicked()) gRouteEditCh = c;
+                    }
                     ImGui::SameLine(200);
                     ImVec2 mp = ImGui::GetCursorScreenPos();
                     float mw = 110, mh = 8;
@@ -4418,6 +4499,27 @@ int main(int argc, char** argv) {
                     char pid[16];
                     snprintf(pid, sizeof(pid), pinging ? "...##p%d" : "PING##p%d", c);
                     if (ImGui::SmallButton(pid) && gOut.running()) gOut.ping(c);
+                }
+                if (ImGui::BeginPopup("##routepop")) {
+                    int c = gRouteEditCh;
+                    ImGui::TextDisabled("CH %d PLAYS", c + 1);
+                    ImGui::Separator();
+                    char it[64];
+                    int L = std::min(c, std::max(0, nch - 2));
+                    snprintf(it, sizeof(it), "Speakers / music  (Ch %d-%d)", L + 1, L + 2);
+                    if (ImGui::Selectable(it)) routeChannel(c, -2, nch);
+                    snprintf(it, sizeof(it), "Surround speakers  (Ch %d-%d)", L + 1, L + 2);
+                    if (ImGui::Selectable(it)) routeChannel(c, -3, nch);
+                    snprintf(it, sizeof(it), "Mono speaker  (Ch %d only, L+R)", c + 1);
+                    if (ImGui::Selectable(it)) routeChannel(c, -4, nch);
+                    ImGui::Separator();
+                    for (int i = NZONES - 1; i >= 0; i--) {
+                        snprintf(it, sizeof(it), "%s ring", kZoneNames[i]);
+                        if (ImGui::Selectable(it)) routeChannel(c, i, nch);
+                    }
+                    ImGui::Separator();
+                    if (ImGui::Selectable("Nothing")) routeChannel(c, -1, nch);
+                    ImGui::EndPopup();
                 }
                 // ── RINGS: solo one to find it by feel ──
                 head("RINGS");
@@ -4575,7 +4677,7 @@ int main(int argc, char** argv) {
                     snprintf(idp, sizeof(idp), "+##%s", tag);
                     if (ImGui::SmallButton(idm)) {
                         v = v <= 0 ? -1 : v - 2;
-                        a.store(v);
+                        a.store(v); saveRouting();
                     }
                     ImGui::SameLine();
                     if (v < 0) ImGui::Text("Off");
@@ -4584,7 +4686,7 @@ int main(int argc, char** argv) {
                     if (ImGui::SmallButton(idp)) {
                         v = v < 0 ? 0 : v + 2;
                         if (v > nch - 2) v = std::max(0, nch - 2);
-                        a.store(v);
+                        a.store(v); saveRouting();
                     }
                 };
 
@@ -4641,14 +4743,14 @@ int main(int argc, char** argv) {
                     snprintf(idr, sizeof(idr), "TEST##%d", z);
                     if (ImGui::SmallButton(idm)) {
                         c = c <= -1 ? -1 : c - 1;
-                        gEngine.params.zoneChan[z].store(c);
+                        gEngine.params.zoneChan[z].store(c); saveRouting();
                     }
                     ImGui::SameLine();
                     if (c < 0) ImGui::Text("Off"); else ImGui::Text("Ch %d", c + 1);
                     ImGui::SameLine();
                     if (ImGui::SmallButton(idp)) {
                         c = std::min(c + 1, nch - 1);
-                        gEngine.params.zoneChan[z].store(c);
+                        gEngine.params.zoneChan[z].store(c); saveRouting();
                     }
                     // second send (same signal to another amp channel; in STEREO
                     // mode the right side of the ring), Off = none
@@ -4661,12 +4763,12 @@ int main(int argc, char** argv) {
                         ImGui::TextDisabled("+");
                         ImGui::SameLine();
                         if (ImGui::SmallButton(id2m))
-                            gEngine.params.zoneChan2[z].store(c2 <= -1 ? -1 : c2 - 1);
+                            gEngine.params.zoneChan2[z].store(c2 <= -1 ? -1 : c2 - 1); saveRouting();
                         ImGui::SameLine();
                         if (c2 < 0) ImGui::TextDisabled("Off"); else ImGui::Text("Ch %d", c2 + 1);
                         ImGui::SameLine();
                         if (ImGui::SmallButton(id2p))
-                            gEngine.params.zoneChan2[z].store(std::min(c2 + 1, nch - 1));
+                            gEngine.params.zoneChan2[z].store(std::min(c2 + 1, nch - 1)); saveRouting();
                     }
                     ImGui::SameLine(300);
                     float tv = gEngine.params.zoneTrim[z].load();

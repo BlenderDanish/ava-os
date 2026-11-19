@@ -1,3 +1,5 @@
+#include <unistd.h>
+#include <cmath>
 #include "audio_out.h"
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreAudio/CoreAudio.h>
@@ -117,6 +119,20 @@ bool maxDeviceHwVolume(unsigned deviceID) {
         }
     }
     return any;
+}
+
+bool setDeviceRate(unsigned deviceID, double hz) {
+    AudioObjectPropertyAddress a = {kAudioDevicePropertyNominalSampleRate,
+                                    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    Float64 cur = 0; UInt32 sz = sizeof(cur);
+    if (AudioObjectGetPropertyData(deviceID, &a, 0, nullptr, &sz, &cur) == noErr && std::fabs(cur - hz) < 1.0) return true;
+    Float64 want = hz;
+    if (AudioObjectSetPropertyData(deviceID, &a, 0, nullptr, sizeof(want), &want) != noErr) return false;
+    for (int i = 0; i < 40; i++) {   // the switch is asynchronous: wait up to ~1 s
+        usleep(25000); sz = sizeof(cur);
+        if (AudioObjectGetPropertyData(deviceID, &a, 0, nullptr, &sz, &cur) == noErr && std::fabs(cur - hz) < 1.0) return true;
+    }
+    return false;
 }
 
 bool OutputUnit::start(unsigned deviceID, Engine* engine, StereoRing* ring) {

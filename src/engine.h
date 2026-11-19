@@ -88,12 +88,14 @@ struct Params {
     std::atomic<float> zoneLevel[NZONES]{{-1.f}, {-1.f}, {-1.f}, {-1.f}, {-1.f}};
     std::atomic<float> masterVolume{1.0f};
     std::atomic<int>   monitorVibOnStereo{0};   // opt-in: Output > "Hear the bed on stereo outputs"
+    std::atomic<int>   transducerOnStereo{0};   // a stereo output (headphone jack) feeds an amp + transducer: every ring, clean, both channels
     // routing (0-based device channel indices)
     std::atomic<int>   musicChanL{0};        // music pair = L,L+1 (ch 1-2 main out); -1 = off
     std::atomic<float> musicGain{1.0f};      // music pair level ×0..1.5
     // surround pair: a second stereo pair carrying the music mix (rear /
     // side speakers). width 0 = mono fill, 1 = full stereo image
     std::atomic<int>   surrChanL{-1};        // surround pair = L,L+1; -1 = off
+    std::atomic<int>   monoMask{0};          // bit c = device channel c plays the music as mono (L+R)/2
     std::atomic<float> surrGain{0.8f};
     std::atomic<float> surrWidth{1.0f};
     // bed wiring: HEAD ch9+10 line out (own amp) · BELLY ch5 · ROOT ch6 · FEET (center) ch4 · HEART ch7
