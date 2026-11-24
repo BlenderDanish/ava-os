@@ -58,6 +58,21 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
     };
 
     std::memset(dst, 0, (size_t)n * ch * sizeof(float));
+    // AVA Circle: 8 transducers = inner layer (FEET+ROOT+BELLY) and outer layer
+    // (HEART+HEAD), each on four quadrants; the orbit leans the level round them
+    const bool circle = eng->params.bedType.load() == 1 && ch > 2;
+    int cc[8]; float cg[8];
+    if (circle) {
+        float depth = eng->params.circOrbitDepth.load();
+        self->circPhase_ += 6.2831853f * eng->params.circOrbitHz.load() * (float)n / 48000.0f;
+        if (self->circPhase_ > 6.2831853f) self->circPhase_ -= 6.2831853f;
+        for (int k = 0; k < 8; k++) {
+            cc[k] = eng->params.circChan[k].load();
+            float lean = 0.5f + 0.5f * std::cos(self->circPhase_ - 1.5707963f * (float)(k & 3));
+            cg[k] = eng->params.circTrim[k].load() * (1.0f - depth * (1.0f - lean));
+        }
+        for (int z = 0; z < NZONES; z++) { zc[z] = -1; zc2[z] = -1; }   // the octagon's rings are not wired on this bed
+    }
     // a ring or mono speaker routed onto a stereo device's own channels (an
     // amp + transducer on the headphone jack) makes it a real bed output:
     // routing, trims, solo, TEST and PING apply as on an interface
@@ -131,6 +146,12 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
             f[surrL] += vol * surrG * (mid + side);
             if (surrL + 1 < ch) f[surrL + 1] += vol * surrG * (mid - side);
         }
+        if (circle) {
+            float in = vibG * (zt[FEET] * vib[FEET][i] + zt[ROOT] * vib[ROOT][i] + zt[BELLY] * vib[BELLY][i]);
+            float out = vibG * (zt[HEART] * vib[HEART][i] + zt[HEAD] * vib[HEAD][i]);
+            for (int k = 0; k < 8; k++)
+                if (cc[k] >= 0 && cc[k] < ch) f[cc[k]] += vol * cg[k] * (k < 4 ? in : out);
+        }
         for (int z = 0; z < NZONES; z++) {
             if (zc[z] >= 0 && zc[z] < ch) f[zc[z]] += vol * vibG * zt[z] * vib[z][i];
             // second send: the same signal, or in STEREO mode the right side
@@ -146,6 +167,7 @@ void mixOutputBlock(OutputUnit* self, Engine* eng, const float* L, const float* 
             if (zc[z] >= 0 && zc[z] < OutputUnit::kMaxCh) zoneCh[zc[z]] = true;
             if (zc2[z] >= 0 && zc2[z] < OutputUnit::kMaxCh) zoneCh[zc2[z]] = true;
         }
+        if (circle) for (int k = 0; k < 8; k++) if (cc[k] >= 0 && cc[k] < OutputUnit::kMaxCh) zoneCh[cc[k]] = true;
         const float aHeat = 1.0f / (45.0f * 48000.0f);
         const float aG = 1.0f / (2.0f * 48000.0f);
         const float budget = lim * lim;

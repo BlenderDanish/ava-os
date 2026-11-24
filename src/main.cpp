@@ -359,7 +359,21 @@ static void setListen(bool on) {
     }).detach();
 }
 // ── output routing: which device channel carries what (routing.txt) ──
+// The circle bed keeps its own wiring (routing_circle.txt) so switching beds
+// never disturbs the octagon's channel map.
+static bool gCircleBed = false;
+static const char* kCircNames[8] = {"INNER 1", "INNER 2", "INNER 3", "INNER 4", "OUTER 1", "OUTER 2", "OUTER 3", "OUTER 4"};
 static void saveRouting() {
+    if (gCircleBed) {
+        auto& P = gEngine.params;
+        if (FILE* f = fopen(appSupportFile("routing_circle.txt").c_str(), "w")) {
+            fprintf(f, "%d %d %d", P.musicChanL.load(), P.surrChanL.load(), P.monoMask.load());
+            for (int k = 0; k < 8; k++) fprintf(f, " %d %.3f", P.circChan[k].load(), P.circTrim[k].load());
+            fprintf(f, " %.3f %.3f\n", P.circOrbitHz.load(), P.circOrbitDepth.load());
+            fclose(f);
+        }
+        return;
+    }
     if (FILE* f = fopen(appSupportFile("routing.txt").c_str(), "w")) {
         fprintf(f, "%d %d", gEngine.params.musicChanL.load(), gEngine.params.surrChanL.load());
         for (int z = 0; z < NZONES; z++) fprintf(f, " %d %d", gEngine.params.zoneChan[z].load(), gEngine.params.zoneChan2[z].load());
@@ -368,6 +382,32 @@ static void saveRouting() {
     }
 }
 static void loadRouting() {
+    if (gCircleBed) {
+        auto& P = gEngine.params;
+        // defaults: music on 1-2, the eight transducers on 3-10
+        P.musicChanL.store(0); P.surrChanL.store(-1); P.monoMask.store(0);
+        for (int z = 0; z < NZONES; z++) { P.zoneChan[z].store(-1); P.zoneChan2[z].store(-1); }
+        for (int k = 0; k < 8; k++) { P.circChan[k].store(2 + k); P.circTrim[k].store(1.0f); }
+        if (FILE* f = fopen(appSupportFile("routing_circle.txt").c_str(), "r")) {
+            int m, sr, mono, c[8]; float t[8], oh = 0.1f, od = 0.0f;
+            bool ok = fscanf(f, "%d %d %d", &m, &sr, &mono) == 3;
+            for (int k = 0; ok && k < 8; k++) ok = fscanf(f, "%d %f", &c[k], &t[k]) == 2;
+            if (ok && fscanf(f, "%f %f", &oh, &od) != 2) { oh = 0.1f; od = 0.0f; }
+            fclose(f);
+            if (ok) {
+                P.musicChanL.store(m); P.surrChanL.store(sr); P.monoMask.store(mono);
+                for (int k = 0; k < 8; k++) { P.circChan[k].store(c[k]); P.circTrim[k].store(t[k]); }
+                P.circOrbitHz.store(oh); P.circOrbitDepth.store(od);
+            }
+        }
+        return;
+    }
+    {   // octagon defaults first, so coming back from the circle without a saved file is still wired
+        static const int dz[NZONES] = {8, 6, 4, 5, 3}, dz2[NZONES] = {9, -1, -1, -1, -1};
+        auto& P = gEngine.params;
+        if (P.zoneChan[0].load() < 0 && P.zoneChan[1].load() < 0 && P.zoneChan[2].load() < 0 && P.zoneChan[3].load() < 0 && P.zoneChan[4].load() < 0)
+            for (int z = 0; z < NZONES; z++) { P.zoneChan[z].store(dz[z]); P.zoneChan2[z].store(dz2[z]); }
+    }
     FILE* f = fopen(appSupportFile("routing.txt").c_str(), "r");
     if (!f) return;
     int m, sr, zc[NZONES], z2[NZONES];
@@ -390,6 +430,7 @@ static void routeChannel(int c, int role, int nch) {
         if (m >= 0 && (x == m || x == m + 1)) P.musicChanL.store(-1);
         if (sr >= 0 && (x == sr || x == sr + 1)) P.surrChanL.store(-1);
         if (x >= 0 && x < 32) P.monoMask.store(P.monoMask.load() & ~(1 << x));
+        if (gCircleBed) for (int j = 0; j < 8; j++) if (P.circChan[j].load() == x) P.circChan[j].store(-1);
         for (int z = 0; z < NZONES; z++) {
             if (P.zoneChan[z].load() == x) { P.zoneChan[z].store(P.zoneChan2[z].load()); P.zoneChan2[z].store(-1); }
             if (P.zoneChan2[z].load() == x) P.zoneChan2[z].store(-1);
@@ -419,6 +460,34 @@ static void loadTransducerOnStereo() {
         if (fscanf(f, "%d", &v) == 1) gEngine.params.transducerOnStereo.store(v != 0);
         fclose(f);
     }
+}
+// which bed AVA is driving, remembered (bed.txt): 0 octagon · 1 circle
+static void setBed(bool circle) {
+    if (circle == gCircleBed) return;
+    saveRouting();                       // the bed we are leaving keeps its wiring
+    gCircleBed = circle;
+    gEngine.params.bedType.store(circle ? 1 : 0);
+    if (!circle) for (int z = 0; z < NZONES; z++) { gEngine.params.zoneChan[z].store(-1); gEngine.params.zoneChan2[z].store(-1); }
+    loadRouting();
+    if (FILE* f = fopen(appSupportFile("bed.txt").c_str(), "w")) { fprintf(f, "%d\n", circle ? 1 : 0); fclose(f); }
+}
+static void loadBed() {
+    if (FILE* f = fopen(appSupportFile("bed.txt").c_str(), "r")) {
+        int v = 0;
+        if (fscanf(f, "%d", &v) == 1) { gCircleBed = v == 1; gEngine.params.bedType.store(gCircleBed ? 1 : 0); }
+        fclose(f);
+    }
+}
+// circle: put transducer k on device channel c (k < 0 = clear the channel)
+static void routeCircle(int c, int k) {
+    auto& P = gEngine.params;
+    int m = P.musicChanL.load(), sr = P.surrChanL.load();
+    if (m >= 0 && (c == m || c == m + 1)) P.musicChanL.store(-1);
+    if (sr >= 0 && (c == sr || c == sr + 1)) P.surrChanL.store(-1);
+    if (c >= 0 && c < 32) P.monoMask.store(P.monoMask.load() & ~(1 << c));
+    for (int j = 0; j < 8; j++) if (P.circChan[j].load() == c) P.circChan[j].store(-1);
+    if (k >= 0 && k < 8) P.circChan[k].store(c);
+    saveRouting();
 }
 static void loadListen() {
     if (FILE* f = fopen(appSupportFile("listen.txt").c_str(), "r")) {
@@ -870,7 +939,12 @@ static void shadedDisc(ImDrawList* dl, ImVec2 c, float r, ImVec2 cc, ImU32 colCe
 }
 
 // light blue: the colour of the signal light in the beads
-static inline ImU32 LB(float a) { return IM_COL32(150, 205, 255, (int)(255 * std::min(1.0f, std::max(0.0f, a)))); }
+// (the circle bed is black and white: there the light is plain white)
+static bool gLampMono = false;
+static inline ImU32 LB(float a) {
+    int al = (int)(255 * std::min(1.0f, std::max(0.0f, a)));
+    return gLampMono ? IM_COL32(255, 255, 255, al) : IM_COL32(150, 205, 255, al);
+}
 
 // a small glass bead lit from the upper left. `sig` is the signal passing
 // through its slice right now (-1..1): the bead swells with it and lights up
@@ -883,7 +957,8 @@ static void rippleDot(ImDrawList* dl, ImVec2 c, float r0, float sig, float lvl, 
     float r = r0 * (1.0f + 0.55f * on);                      // the bead swells with the signal
     if (on > 0.03f) {
         // lamp glow: a soft light-blue halo falling off to nothing
-        shadedDisc(dl, c, r * (2.6f + 3.0f * on), c, LB(0.45f * on), LB(0.0f), segs);
+        if (gLampMono) shadedDisc(dl, c, r * (1.8f + 1.2f * on), c, LB(0.18f * on), LB(0.0f), segs);
+        else shadedDisc(dl, c, r * (2.6f + 3.0f * on), c, LB(0.45f * on), LB(0.0f), segs);
     }
     if (lvl > 0.04f) {
         const int rings = 3;
@@ -891,7 +966,7 @@ static void rippleDot(ImDrawList* dl, ImVec2 c, float r0, float sig, float lvl, 
         for (int j = 0; j < rings; j++) {
             float ph = std::fmod(t * (0.9f + 0.6f * lvl) + seed + j / (float)rings, 1.0f);
             float rr = r0 + ph * (r0 * 2.2f + r0 * 3.5f * lvl);
-            float a = (1.0f - ph) * (1.0f - ph) * 0.35f * ol;
+            float a = (1.0f - ph) * (1.0f - ph) * (gLampMono ? 0.18f : 0.35f) * ol;
             dl->AddCircle(c, rr, LB(a), segs, std::max(0.8f, 1.6f * (1.0f - ph)));
         }
     }
@@ -901,8 +976,9 @@ static void rippleDot(ImDrawList* dl, ImVec2 c, float r0, float sig, float lvl, 
     // the sphere: grey glass when dark, light blue from within when lit
     ImVec2 light(c.x - r * 0.35f, c.y - r * 0.38f);
     auto mixc = [&](float g, float bl) {                     // grey g (0..1) blended toward light blue by bl
-        int R_ = (int)(255 * (g * (1 - bl) + 150 / 255.0f * bl));
-        int G_ = (int)(255 * (g * (1 - bl) + 205 / 255.0f * bl));
+        float lr = gLampMono ? 1.0f : 150 / 255.0f, lg = gLampMono ? 1.0f : 205 / 255.0f;
+        int R_ = (int)(255 * (g * (1 - bl) + lr * bl));
+        int G_ = (int)(255 * (g * (1 - bl) + lg * bl));
         int B_ = (int)(255 * (g * (1 - bl) + 255 / 255.0f * bl));
         return IM_COL32(R_, G_, B_, 255);
     };
@@ -912,7 +988,264 @@ static void rippleDot(ImDrawList* dl, ImVec2 c, float r0, float sig, float lvl, 
     shadedDisc(dl, light, r * 0.34f, light, IM_COL32(255, 255, 255, (int)(255 * (0.75f + 0.25f * on))), IM_COL32(255, 255, 255, 0), 32);
 }
 
+// ── AVA Circle: the round bed seen from above ──
+// An inner disc and an outer ring, each in four quadrants; every piece is one
+// transducer. Same glass as the octagon: white rounded pads that breathe with
+// their level, a bead at the transducer that ripples with its signal. Click a
+// pad to feel that transducer (PING).
+static bool  gCircSpin = false;   // Settings > OUTPUT > Slow turn (circle_spin.txt)
+static float gCircTurn = 0;       // how far the slow turn has carried the view
+static void drawCircleBed(ImDrawList* dl, ImVec2 c, float R) {
+    if (gOctStyle == 2) return;
+    // the view sits 45 degrees round, so the transducers line up straight: up,
+    // right, down, left. With Slow turn on it drifts round, one turn in ~2 min.
+    static bool spinLoaded = false;
+    if (!spinLoaded) {
+        spinLoaded = true;
+        if (FILE* f = fopen(appSupportFile("circle_spin.txt").c_str(), "r")) { int v = 0; if (fscanf(f, "%d", &v) == 1) gCircSpin = v == 1; fclose(f); }
+    }
+    if (gCircSpin) gCircTurn = std::fmod(gCircTurn + ImGui::GetIO().DeltaTime * 0.05f, 6.2831853f);
+    const float rot = -0.78539816f + gCircTurn;
+    gLampMono = true;                                      // black and white only
+    struct MonoOff { ~MonoOff() { gLampMono = false; } } monoOff;
+    const bool outline = gOctStyle == 1;
+    const float h = std::max(3.0f, R * 0.011f);            // half the gap: the octagon's padding
+    const float rc = std::max(5.0f, R * 0.030f);           // corner radius, as the octagon's pads
+    const float split = 0.585f * R;                        // where the inner disc meets the outer ring
+    // inner pieces run to a rounded tip at the hub; outer ones are ring quarters
+    const float rIn[2]  = {1.41421356f * (h + rc) - rc, split + h};
+    const float rOut[2] = {split - h, 0.96f * R};
+    const int baseAlpha[2] = {205, 150};                   // outer more transparent, like the octagon's rings
+    const float kHalfPi = 1.5707963f, kTwoPi = 6.2831853f;
+    float tNow = (float)ImGui::GetTime();
+
+    // each layer's own signal for the beads (inner follows ROOT, outer HEART)
+    const int sN = Engine::kScopeLen, sW = gEngine.scopeW.load(std::memory_order_relaxed);
+    const int layerZone[2] = {ROOT, HEART};
+    float layerLvl[2] = {std::max(gEngine.meter[2 + FEET].load(), std::max(gEngine.meter[2 + ROOT].load(), gEngine.meter[2 + BELLY].load())),
+                         std::max(gEngine.meter[2 + HEART].load(), gEngine.meter[2 + HEAD].load())};
+    float sigPk[2];
+    for (int l = 0; l < 2; l++) {
+        float pk = 0.02f;
+        for (int i = 1; i <= 96; i++) pk = std::max(pk, std::fabs(gEngine.vibScope[layerZone[l]][(sW - i + sN) % sN]));
+        sigPk[l] = pk;
+    }
+
+    ImVec2 m = ImGui::GetIO().MousePos;
+    float md = std::sqrt((m.x - c.x) * (m.x - c.x) + (m.y - c.y) * (m.y - c.y));
+    float ma = std::atan2(m.y - c.y, m.x - c.x);
+    bool canHover = !ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive() &&
+                    !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+    const int nDev = gOut.running() ? gOut.activeChannels : 0;
+
+    // the sound comes from underneath: one big light under the whole bed that
+    // swells with the music, and a light under every transducer pulsing with
+    // its own output, seen through the glass and spilling out between the pads
+    if (!outline) {
+        float all = std::min(1.0f, std::max(layerLvl[0], layerLvl[1]));
+        float breath = 0.5f + 0.5f * std::sin(tNow * 1.1f);
+        shadedDisc(dl, c, R * (1.05f + 0.18f * all + 0.02f * breath), c,
+                   LB(0.03f + 0.02f * breath + 0.14f * all), LB(0.0f), 96);
+        for (int k = 7; k >= 0; k--) {
+            int ring = k < 4 ? 0 : 1, q = k & 3;
+            int ch = gEngine.params.circChan[k].load();
+            float lvl = (ch >= 0 && ch < nDev) ? std::min(1.0f, gOut.chanPeak[ch].load() * 1.6f) : std::min(1.0f, layerLvl[ring]);
+            float sig = gEngine.vibScope[layerZone[ring]][(sW - 1 - q * 3 + sN) % sN] / sigPk[ring] * std::min(1.0f, lvl * 4.0f);
+            float pulse = std::min(1.0f, lvl * (0.80f + 0.20f * std::sin(tNow * 5.0f + q * 1.571f + ring)) + 0.30f * std::fabs(sig));
+            float rm = ring ? 0.5f * (rIn[1] + rOut[1]) : 0.56f * rOut[0], am = -kHalfPi + (q + 0.5f) * kHalfPi + rot;
+            ImVec2 p(c.x + rm * std::cos(am), c.y + rm * std::sin(am));
+            shadedDisc(dl, p, R * (0.24f + 0.08f * ring) * (1.0f + 0.45f * pulse), p,
+                       LB(0.02f + 0.22f * pulse), LB(0.0f), 64);
+        }
+    }
+
+    for (int k = 7; k >= 0; k--) {                         // outer first, as the octagon draws
+        int ring = k < 4 ? 0 : 1, q = k & 3;
+        float r0 = rIn[ring], r1 = rOut[ring];
+        float a0 = -kHalfPi + q * kHalfPi + rot, a1 = a0 + kHalfPi;   // Q1 = top right, clockwise
+        // corner circles: tangent to the arc and to the cut line set back by h
+        float dO = std::asin(std::min(1.0f, (h + rc) / (r1 - rc)));
+        float dI = std::asin(std::min(1.0f, (h + rc) / (r0 + rc)));
+        auto pol = [&](float r, float a) { return ImVec2(c.x + r * std::cos(a), c.y + r * std::sin(a)); };
+        // the outline as one clean clockwise loop (no repeated points: the
+        // concave fill needs a simple polygon)
+        ImVec2 pts[160]; int np = 0;
+        auto arc = [&](ImVec2 o, float r, float s0, float s1, int n) {
+            for (int i = 0; i <= n; i++) {
+                float t = s0 + (s1 - s0) * (float)i / (float)n;
+                ImVec2 v(o.x + r * std::cos(t), o.y + r * std::sin(t));
+                if (np > 0 && std::fabs(v.x - pts[np - 1].x) + std::fabs(v.y - pts[np - 1].y) < 0.35f) continue;
+                if (np < 160) pts[np++] = v;
+            }
+        };
+        arc(c, r1, a0 + dO, a1 - dO, 48);
+        arc(pol(r1 - rc, a1 - dO), rc, a1 - dO, a1 + kHalfPi, 8);
+        arc(pol(r0 + rc, a1 - dI), rc, a1 + kHalfPi, a1 - dI + 3.14159265f, 8);
+        if (a1 - dI > a0 + dI + 1e-3f) arc(c, r0, a1 - dI, a0 + dI, 32);
+        arc(pol(r0 + rc, a0 + dI), rc, a0 + dI + 3.14159265f, a0 + 3 * kHalfPi, 8);
+        arc(pol(r1 - rc, a0 + dO), rc, a0 - kHalfPi, a0 + dO, 8);
+        if (np > 2 && std::fabs(pts[0].x - pts[np - 1].x) + std::fabs(pts[0].y - pts[np - 1].y) < 0.35f) np--;
+
+        int ch = gEngine.params.circChan[k].load();
+        bool wired = ch >= 0 && ch < nDev;
+        // level: the transducer's own output when it is wired, else its layer
+        float lvl = wired ? std::min(1.0f, gOut.chanPeak[ch].load() * 1.6f) : std::min(1.0f, layerLvl[ring]);
+        float rel = ma - a0; rel -= std::floor(rel / kTwoPi) * kTwoPi;
+        bool hov = canHover && md >= r0 && md <= r1 && rel <= kHalfPi;
+        bool held = ch >= 0 && gOut.pingChan.load() == ch;
+
+        // audio-reactive glass, the octagon's recipe
+        int a = (int)(baseAlpha[ring] * (0.60f + 0.40f * lvl)
+                      + 14.0f * std::sin(q * 1.7f + ring)
+                      + (8.0f + 30.0f * lvl) * std::sin(tNow * 1.6f + q * 1.571f + ring * 1.3f));
+        a = std::min(250, std::max(55, a));
+        if (ch < 0) a = (int)(a * 0.45f);                  // not wired to any output
+        if (hov) { a = std::min(252, a + 44); ImGui::SetMouseCursor(ImGuiMouseCursor_Hand); }
+        if (held) a = 252;
+        // the transducer: a lamp at the centre of the piece, rippling with its
+        // signal. In glass mode it is drawn first, so it sits under the pane.
+        auto drawLamp = [&]() {
+            float rm = ring ? 0.5f * (r0 + r1) : 0.56f * r1, am = 0.5f * (a0 + a1);
+            float sig = gEngine.vibScope[layerZone[ring]][(sW - 1 - q * 3 + sN) % sN] / sigPk[ring] * std::min(1.0f, lvl * 4.0f);
+            if (outline) { rippleDot(dl, pol(rm, am), std::max(5.0f, R * 0.020f), sig, lvl, q * 0.37f + ring * 0.9f); return; }
+            // a swarm of little lights of different sizes, each drifting on its own
+            // slow path and twinkling. A few at rest; more wake outward, and they
+            // swell and brighten, as the vibration through this transducer rises.
+            ImVec2 o = pol(rm, am);
+            // the transducer's own lamp is always there; the swarm rises around it
+            rippleDot(dl, o, std::max(4.0f, R * 0.017f), sig, lvl, q * 0.37f + ring * 0.9f);
+            const int   N = 760;
+            const float drive = std::min(1.0f, lvl * 1.35f);
+            const float front = std::max(0.0f, (drive - 0.08f) / 0.92f);   // nothing at rest: they come up after the lamp
+            const float cloudR = R * 0.125f * (0.80f + 0.20f * drive);
+            const float px = std::max(0.32f, R * 0.00075f);
+            auto hash = [&](float n) { float v = std::sin(n) * 43758.5453f; return v - std::floor(v); };
+            for (int i = 0; i < N; i++) {
+                float f = (i + 0.5f) / N;
+                float act = std::min(1.0f, std::max(0.0f, (front - f) / 0.10f));
+                if (act <= 0.01f) break;                                  // ordered inside-out: the rest are dark
+                float h1 = hash(i * 12.9898f + k * 78.233f), h2 = hash(i * 39.3467f + k * 11.135f), h3 = hash(i * 73.1561f + k * 5.271f);
+                // its own path: a slow orbit (either way) with a breathing radius
+                float th = i * 2.3999632f + k * 0.7f + tNow * (0.10f + 0.55f * h3) * (h1 < 0.5f ? 1.0f : -1.0f);
+                float rad = std::sqrt(f) * (1.0f + 0.22f * std::sin(tNow * (0.5f + 1.3f * h1) + h2 * 6.2831853f));
+                int di = (int)(std::sqrt(f) * 150.0f) + (int)(h1 * 6.0f);
+                float sv = gEngine.vibScope[layerZone[ring]][(sW - 1 - di + sN) % sN] / sigPk[ring];
+                float vib = std::min(1.0f, std::fabs(sv)) * std::min(1.0f, lvl * 4.0f);
+                float rr = R * 0.022f + cloudR * rad * (1.0f + 0.12f * sv * drive);
+                // sizes: mostly dust, a few clearly larger lights
+                float big = h2 * h2 * h2 * h2;
+                float sz = px * (0.55f + 0.5f * h1 + 2.6f * big) * (1.0f + 0.8f * vib * act);
+                float tw = 0.60f + 0.40f * std::sin(tNow * (1.5f + 4.5f * h3) + h1 * 40.0f);   // twinkle
+                float al = act * (0.12f + 0.48f * vib) * (1.0f - 0.50f * std::sqrt(f)) * tw;
+                al = std::min(1.0f, al);
+                ImVec2 pt(o.x + rr * std::cos(th), o.y + rr * std::sin(th));
+                if (sz > 1.6f) {
+                    shadedDisc(dl, pt, sz * 2.0f, pt, W(al * 0.20f), W(0.0f), 12);    // a soft halo on the larger ones
+                    dl->AddCircleFilled(pt, sz, W(al), 12);
+                } else {
+                    dl->AddRectFilled(ImVec2(pt.x - sz, pt.y - sz), ImVec2(pt.x + sz, pt.y + sz), W(al), sz * 0.9f);
+                }
+            }
+        };
+        if (!outline) drawLamp();
+        if (outline) {
+            dl->AddConcavePolyFilled(pts, np, IM_COL32(255, 255, 255, a / 10));
+            dl->AddPolyline(pts, np, held ? IM_COL32(255, 255, 255, 230) : IM_COL32(255, 255, 255, 40 + a / 4),
+                            ImDrawFlags_Closed, held ? 2.5f : 1.0f);
+        } else {
+            // glass: the pad is a strip between its hub-side edge and its rim-side
+            // edge, shaded by the GPU so the light falls off outwards from the hub
+            ImVec2 eo[80], ei[80]; int no = 0, ni = 0;
+            auto arcB = [&](ImVec2* buf, int& n, ImVec2 o, float r, float s0, float s1, int cnt) {
+                for (int i = 0; i <= cnt; i++) {
+                    float t = s0 + (s1 - s0) * (float)i / (float)cnt;
+                    if (n < 80) buf[n++] = ImVec2(o.x + r * std::cos(t), o.y + r * std::sin(t));
+                }
+            };
+            arcB(eo, no, pol(r1 - rc, a0 + dO), rc, a0 - kHalfPi, a0 + dO, 8);
+            arcB(eo, no, c, r1, a0 + dO, a1 - dO, 48);
+            arcB(eo, no, pol(r1 - rc, a1 - dO), rc, a1 - dO, a1 + kHalfPi, 8);
+            arcB(ei, ni, pol(r0 + rc, a0 + dI), rc, a0 + 3 * kHalfPi, a0 + dI + 3.14159265f, 8);
+            if (a1 - dI > a0 + dI + 1e-3f) arcB(ei, ni, c, r0, a0 + dI, a1 - dI, 32);
+            arcB(ei, ni, pol(r0 + rc, a1 - dI), rc, a1 - dI + 3.14159265f, a1 + kHalfPi, 8);
+            auto along = [](const ImVec2* buf, int n, float f) {      // point at length fraction f
+                float len[80]; len[0] = 0;
+                for (int i = 1; i < n; i++) len[i] = len[i - 1] + std::sqrt((buf[i].x - buf[i - 1].x) * (buf[i].x - buf[i - 1].x) + (buf[i].y - buf[i - 1].y) * (buf[i].y - buf[i - 1].y));
+                float want = f * len[n - 1];
+                int i = 1; while (i < n - 1 && len[i] < want) i++;
+                float seg = len[i] - len[i - 1], u = seg > 1e-5f ? (want - len[i - 1]) / seg : 0.0f;
+                return ImVec2(buf[i - 1].x + (buf[i].x - buf[i - 1].x) * u, buf[i - 1].y + (buf[i].y - buf[i - 1].y) * u);
+            };
+            const int N = 48, rows = 4;
+            const float rowT[rows] = {0.0f, 0.22f, 0.60f, 1.0f};      // hub side -> rim side
+            const float rowA[rows] = {0.40f, 0.27f, 0.15f, 0.08f};   // clear glass, so the light under it reads
+            const ImVec2 gc = pol(ring ? 0.5f * (r0 + r1) : 0.56f * r1, 0.5f * (a0 + a1));
+            const float gsz = 0.5f * (r1 - r0) + 0.35f * r1;          // rough half size of the pane
+            dl->PrimReserve((N - 1) * (rows - 1) * 6, N * rows);
+            ImVec2 uv = dl->_Data->TexUvWhitePixel;
+            unsigned base = dl->_VtxCurrentIdx;
+            for (int i = 0; i < N; i++) {
+                float f = (float)i / (float)(N - 1);
+                ImVec2 pi = along(ei, ni, f), po = along(eo, no, f);
+                for (int j = 0; j < rows; j++) {
+                    float t = rowT[j];
+                    // plain white glass: only the opacity changes, hub to rim
+                    ImVec2 v(pi.x + (po.x - pi.x) * t, pi.y + (po.y - pi.y) * t);
+                    // sheen: the pane catches the light on its upper-left side
+                    float sh = std::min(1.0f, std::max(0.0f, 0.5f + 0.5f * (-0.6f * (v.x - gc.x) - 0.8f * (v.y - gc.y)) / gsz));
+                    float al = a * (rowA[j] * (0.55f + 0.45f * sh) + 0.34f * sh * sh * sh);
+                    ImU32 col = IM_COL32(255, 255, 255, (int)std::min(250.0f, al));
+                    dl->PrimWriteVtx(v, uv, col);
+                }
+            }
+            for (int i = 0; i < N - 1; i++)
+                for (int j = 0; j < rows - 1; j++) {
+                    unsigned p = base + i * rows + j;
+                    dl->PrimWriteIdx((ImDrawIdx)p); dl->PrimWriteIdx((ImDrawIdx)(p + rows)); dl->PrimWriteIdx((ImDrawIdx)(p + rows + 1));
+                    dl->PrimWriteIdx((ImDrawIdx)p); dl->PrimWriteIdx((ImDrawIdx)(p + rows + 1)); dl->PrimWriteIdx((ImDrawIdx)(p + 1));
+                }
+            // glass edge: a soft bevel, then a hairline rim lit from the upper left
+            ImVec2 pc = pol(ring ? 0.5f * (r0 + r1) : 0.56f * r1, 0.5f * (a0 + a1));
+            auto litRim = [&](float thick, float gain) {
+                int v0 = dl->VtxBuffer.Size;
+                dl->AddPolyline(pts, np, IM_COL32(255, 255, 255, 255), ImDrawFlags_Closed, thick);
+                for (int i = v0; i < dl->VtxBuffer.Size; i++) {
+                    ImDrawVert& v = dl->VtxBuffer[i];
+                    float dx = v.pos.x - pc.x, dy = v.pos.y - pc.y, d = std::sqrt(dx * dx + dy * dy) + 1e-4f;
+                    float lit = 0.5f + 0.5f * (-0.6f * dx - 0.8f * dy) / d;
+                    float kk = held ? 0.95f : gain * (0.10f + 0.90f * lit * lit) * (0.45f + 0.55f * a / 250.0f);
+                    unsigned al = (unsigned)((v.col >> IM_COL32_A_SHIFT) * std::min(1.0f, kk));
+                    v.col = (v.col & ~IM_COL32_A_MASK) | (al << IM_COL32_A_SHIFT);
+                }
+            };
+            {   // the pane's thickness: a dark edge on the side away from the light
+                int v0 = dl->VtxBuffer.Size;
+                dl->AddPolyline(pts, np, IM_COL32(0, 0, 0, 255), ImDrawFlags_Closed, std::max(2.5f, R * 0.010f));
+                for (int i = v0; i < dl->VtxBuffer.Size; i++) {
+                    ImDrawVert& v = dl->VtxBuffer[i];
+                    float dx = v.pos.x - pc.x, dy = v.pos.y - pc.y, d = std::sqrt(dx * dx + dy * dy) + 1e-4f;
+                    float dark = 0.5f - 0.5f * (-0.6f * dx - 0.8f * dy) / d;
+                    unsigned al = (unsigned)((v.col >> IM_COL32_A_SHIFT) * 0.55f * dark * dark);
+                    v.col = (v.col & ~IM_COL32_A_MASK) | (al << IM_COL32_A_SHIFT);
+                }
+            }
+            litRim(std::max(4.0f, R * 0.016f), 0.20f);
+            litRim(held ? 2.5f : 1.4f, 1.0f);
+        }
+
+        // the transducer: a bead at the centre of the piece, rippling with its signal
+        if (outline) drawLamp();
+
+        if (hov) {
+            if (ch >= 0) ImGui::SetTooltip("%s  ·  Ch %d\nclick to feel this transducer", kCircNames[k], ch + 1);
+            else ImGui::SetTooltip("%s  ·  not wired (Settings > CHANNELS)", kCircNames[k]);
+            if (ImGui::IsMouseClicked(0) && wired) gOut.ping(ch);
+        }
+    }
+}
+
 static void drawOctagon(ImDrawList* dl, ImVec2 c, float R) {
+    if (gCircleBed) { drawCircleBed(dl, c, R); return; }
     if (gOctStyle == 2) return;                // hidden (Display > Octagon)
     const bool outline = gOctStyle == 1;       // outlines only, minimal fill
     // zone per ring: center pad = FEET, then ROOT→HEAD outward (grounded
@@ -3909,6 +4242,7 @@ static LaunchSlot launchSlot(int ring, int k) {
     return {1, vfxIndex(outer[k])};
 }
 static void drawOctagonLauncher(ImDrawList* dl, ImVec2 c, float R) {
+    if (gCircleBed) { drawCircleBed(dl, c, R); return; }
     const int ringZone[4] = {ROOT, BELLY, HEART, HEAD};
     const float bounds[5] = {0.36f, 0.50f, 0.65f, 0.80f, 0.96f};
     float roundR = std::max(5.0f, R * 0.030f);
@@ -4143,6 +4477,7 @@ int main(int argc, char** argv) {
         setTakeOver(iface && !ifaceIsDefault);
     }
     loadListen();
+    loadBed();
     loadRouting();
     loadTransducerOnStereo();
     startTapAsync();
@@ -4334,6 +4669,26 @@ int main(int argc, char** argv) {
                 // ── OUTPUT: one line — the device, a status dot, its hardware knob ──
                 head("OUTPUT", true);
                 {
+                    // which bed this Mac is driving
+                    ImGui::Text("Bed"); ImGui::SameLine(78);
+                    for (int b = 0; b < 2; b++) {
+                        bool on = gCircleBed == (b == 1);
+                        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1, 1, 1, 0.28f));
+                        if (ImGui::Button(b ? "Circle##bed" : "Octagon##bed", ImVec2(96, 0))) setBed(b == 1);
+                        if (on) ImGui::PopStyleColor();
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip(b ? "AVA Circle: the round bed, 8 transducers (inner + outer, four quadrants).\nKeeps its own channel wiring."
+                                                : "The octagon bed: five body rings, head to feet.");
+                        if (!b) ImGui::SameLine();
+                    }
+                    if (gCircleBed) {
+                        ImGui::SameLine();
+                        if (ImGui::Checkbox("Slow turn", &gCircSpin)) {
+                            if (!gCircSpin) gCircTurn = 0;   // off: back to the straight view
+                            if (FILE* f = fopen(appSupportFile("circle_spin.txt").c_str(), "w")) { fprintf(f, "%d\n", gCircSpin ? 1 : 0); fclose(f); }
+                        }
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Slowly turn the circle on screen. The view only: the wiring and the sound stay put.");
+                    }
                     const char* cur = devOk ? gDevices[gSelDevice].name.c_str() : "No output device";
                     ImGui::SetNextItemWidth(300);
                     if (ImGui::BeginCombo("##setdev", cur)) {
@@ -4430,6 +4785,9 @@ int main(int argc, char** argv) {
                     if (surrL >= 0 && c == surrL) app("SURR L");
                     if (surrL >= 0 && c == surrL + 1) app("SURR R");
                     if (c < 32 && (gEngine.params.monoMask.load() & (1 << c))) app("MONO SPEAKER");
+                    if (gCircleBed) {
+                        for (int k = 0; k < 8; k++) if (gEngine.params.circChan[k].load() == c) app(kCircNames[k]);
+                    } else
                     for (int z = 0; z < NZONES; z++)
                         if (gEngine.params.zoneChan[z].load() == c ||
                             gEngine.params.zoneChan2[z].load() == c) app(kZoneNames[z]);
@@ -4513,6 +4871,12 @@ int main(int argc, char** argv) {
                     snprintf(it, sizeof(it), "Mono speaker  (Ch %d only, L+R)", c + 1);
                     if (ImGui::Selectable(it)) routeChannel(c, -4, nch);
                     ImGui::Separator();
+                    if (gCircleBed) {
+                        for (int k = 0; k < 8; k++) {
+                            snprintf(it, sizeof(it), "%s transducer", kCircNames[k]);
+                            if (ImGui::Selectable(it)) routeCircle(c, k);
+                        }
+                    } else
                     for (int i = NZONES - 1; i >= 0; i--) {
                         snprintf(it, sizeof(it), "%s ring", kZoneNames[i]);
                         if (ImGui::Selectable(it)) routeChannel(c, i, nch);
@@ -4520,6 +4884,36 @@ int main(int argc, char** argv) {
                     ImGui::Separator();
                     if (ImGui::Selectable("Nothing")) routeChannel(c, -1, nch);
                     ImGui::EndPopup();
+                }
+                // ── CIRCLE: the eight transducers' levels, and the orbit ──
+                if (gCircleBed) {
+                    head("CIRCLE");
+                    auto& P = gEngine.params;
+                    for (int k = 0; k < 8; k++) {
+                        int cch = P.circChan[k].load();
+                        ImGui::Text("%s", kCircNames[k]); ImGui::SameLine(78);
+                        if (cch >= 0) ImGui::TextDisabled("Ch %-2d", cch + 1); else ImGui::TextDisabled("off  ");
+                        ImGui::SameLine(140);
+                        float tv = P.circTrim[k].load();
+                        char id[16]; snprintf(id, sizeof id, "##ct%d", k);
+                        ImGui::SetNextItemWidth(170);
+                        if (ImGui::SliderFloat(id, &tv, 0.0f, 1.5f, "%.2f")) P.circTrim[k].store(tv);
+                        if (ImGui::IsItemDeactivatedAfterEdit()) saveRouting();
+                        ImGui::SameLine();
+                        snprintf(id, sizeof id, "TEST##cp%d", k);
+                        if (ImGui::SmallButton(id) && cch >= 0 && gOut.running()) gOut.ping(cch);
+                    }
+                    ImGui::TextDisabled("inner = feet + root + belly   ·   outer = heart + head");
+                    float od = P.circOrbitDepth.load(), oh = P.circOrbitHz.load();
+                    ImGui::Text("Orbit"); ImGui::SameLine(78);
+                    ImGui::SetNextItemWidth(150);
+                    if (ImGui::SliderFloat("##cod", &od, 0.0f, 1.0f, od < 0.005f ? "off" : "depth %.2f")) P.circOrbitDepth.store(od);
+                    if (ImGui::IsItemDeactivatedAfterEdit()) saveRouting();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("the level travels round the four quadrants\n0 = every quadrant plays equally");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(150);
+                    if (ImGui::SliderFloat("##coh", &oh, 0.02f, 2.0f, "%.2f turns / s")) P.circOrbitHz.store(oh);
+                    if (ImGui::IsItemDeactivatedAfterEdit()) saveRouting();
                 }
                 // ── RINGS: solo one to find it by feel ──
                 head("RINGS");

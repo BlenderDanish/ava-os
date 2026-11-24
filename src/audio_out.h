@@ -92,6 +92,7 @@ public:
     bool tapMutesSource = false;
     std::atomic<int> pingLeft_{0}; // samples remaining (audio thread owned)
     float pingPhase_ = 0;
+    float circPhase_ = 0;   // circle bed: orbit angle
     // thermal guard state per device channel (zone channels only): running
     // mean-square (~45 s) and the gain currently applied. chanHeat = fraction
     // of the RMS budget (1.0 = at the limit) for the health monitor.

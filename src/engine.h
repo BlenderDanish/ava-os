@@ -89,6 +89,13 @@ struct Params {
     std::atomic<float> masterVolume{1.0f};
     std::atomic<int>   monitorVibOnStereo{0};   // opt-in: Output > "Hear the bed on stereo outputs"
     std::atomic<int>   transducerOnStereo{0};   // a stereo output (headphone jack) feeds an amp + transducer: every ring, clean, both channels
+    // AVA Circle (round bed): an inner disc and an outer ring, each cut in four
+    // quadrants, one transducer per piece. k 0-3 = inner Q1-4, 4-7 = outer Q1-4.
+    std::atomic<int>   bedType{0};              // 0 octagon (five body rings) · 1 circle
+    std::atomic<int>   circChan[8]{{2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}};   // device channel, -1 = off
+    std::atomic<float> circTrim[8]{{1.f}, {1.f}, {1.f}, {1.f}, {1.f}, {1.f}, {1.f}, {1.f}};
+    std::atomic<float> circOrbitHz{0.1f};       // how fast the emphasis travels round the quadrants
+    std::atomic<float> circOrbitDepth{0.0f};    // 0 = every quadrant equal · 1 = one quadrant at a time
     // routing (0-based device channel indices)
     std::atomic<int>   musicChanL{0};        // music pair = L,L+1 (ch 1-2 main out); -1 = off
     std::atomic<float> musicGain{1.0f};      // music pair level ×0..1.5
