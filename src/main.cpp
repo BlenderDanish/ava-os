@@ -3295,51 +3295,54 @@ static void drawWaveBody(float w, bool audio = false) {
         // the lanes take whatever height the card has left; on the Audio page
         // they're a full 150 and the page scrolls down to the engine grid
         float roomH = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y - top - 16;
-        const float lane = audio ? 92.0f : std::max(44.0f, std::min(110.0f, (roomH - 4 * laneGap) / NZONES));
-        const float volH = audio ? 32.0f : 0.0f;              // the volume strip under the wave, with room above and beneath
+        const float lane = audio ? 108.0f : std::max(44.0f, std::min(110.0f, (roomH - 4 * laneGap) / NZONES));
+        const float volH = audio ? 36.0f : 0.0f;              // the volume strip under the wave: tall enough for a finger
+        const float hdr = audio ? 26.0f : 0.0f;               // Audio page: the name sits in its own row above the wave
+        const float lx = audio ? o.x + 10 : o.x + 68;         // ...so the wave runs the full width (fits a narrow window)
+        const float lw_ = o.x + w - 8 - lx;
         const float fxH = audio ? 30.0f : 0.0f;              // the layer-effects row, when a lane is opened
         float ly = top;
         for (int z = 0; z < NZONES; z++) {
             const bool fxOpen = audio && gLaneFx[z];
             const float laneH = lane + (fxOpen ? fxH : 0);
-            float mid = ly + (lane - volH) / 2 + 1, amp = (lane - volH) * 0.42f;
+            float mid = ly + hdr + (lane - volH - hdr) / 2 + (audio ? -1 : 1), amp = (lane - volH - hdr) * 0.42f;
             dl->AddRectFilled(ImVec2(o.x, ly), ImVec2(o.x + w, ly + laneH), IM_COL32(8, 8, 9, 255), 10);
             if (audio) {
-                dl->AddRectFilled(ImVec2(o.x + 68, ly + 4), ImVec2(o.x + w - 8, ly + lane - volH - 2), IM_COL32(4, 4, 5, 255), 6);
-                dl->AddLine(ImVec2(o.x + 72, mid), ImVec2(o.x + w - 12, mid), W(0.06f), 1.0f);
+                dl->AddRectFilled(ImVec2(lx, ly + hdr), ImVec2(o.x + w - 8, ly + lane - volH - 2), IM_COL32(4, 4, 5, 255), 6);
+                dl->AddLine(ImVec2(lx + 4, mid), ImVec2(o.x + w - 12, mid), W(0.06f), 1.0f);
+                if (ImGui::IsMouseHoveringRect(ImVec2(lx, ly + hdr), ImVec2(o.x + w - 8, ly + lane - volH - 2)) && !ImGui::IsAnyItemActive())
+                    ImGui::SetTooltip("white: the vibration now\nblue: its level over the last 13 s");
             } else {
                 graticule(o.x + 68, ly + 4, o.x + w - 8, ly + lane - volH - 2);
             }
             if (audio) {
                 // volume: a thin slider the width of the wave, the live level as a hairline over it
-                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-                ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 6.0f);
-                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 4));
+                ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 10.0f);
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
                 // the volume is blue: the grab, the filled part, the live level
                 ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(150 / 255.0f, 205 / 255.0f, 1.0f, 0.95f));
                 ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(190 / 255.0f, 225 / 255.0f, 1.0f, 1.0f));
-                ImGui::SetCursorScreenPos(ImVec2(o.x + 68, ly + lane - volH + 11));
-                ImGui::SetNextItemWidth(w - 76);
+                ImGui::SetCursorScreenPos(ImVec2(lx, ly + lane - volH + 6));
+                ImGui::SetNextItemWidth(lw_);
                 char vid[16]; snprintf(vid, sizeof vid, "##vol%d", z);
                 float v = gZoneSlider[z];
-                if (gFontSmall) ImGui::PushFont(gFontSmall);   // a thinner strip: the frame follows the font
+                if (gFontSmall) ImGui::PushFont(gFontSmall);
                 if (ImGui::SliderFloat(vid, &v, 0.0f, 1.0f, "")) { gZoneSlider[z] = v; gEngine.params.zoneLevel[z].store(v); }
-                if (gFontSmall) ImGui::PopFont();
+                if (ImGui::IsItemHovered() && !ImGui::IsItemActive()) ImGui::SetTooltip("%s volume\nthe bright line inside is the live signal", kZoneNames[z]);
                 {
+                    // filled to the volume; the live signal is one bright line along the strip's floor
                     ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
-                    dl->AddRectFilled(ImVec2(r0.x, r0.y), ImVec2(r0.x + (r1.x - r0.x) * v, r1.y), LB(0.18f), 4.0f);
+                    dl->AddRectFilled(ImVec2(r0.x, r0.y), ImVec2(r0.x + (r1.x - r0.x) * v, r1.y), LB(0.18f), 6.0f);
+                    float lv = std::min(1.0f, gEngine.meter[2 + z].load());
+                    if (lv > 0.005f) dl->AddLine(ImVec2(r0.x + 4, r1.y - 2.5f), ImVec2(r0.x + 4 + (r1.x - r0.x - 8) * lv, r1.y - 2.5f), LB(0.85f), 2.0f);
                 }
                 ImGui::PopStyleColor(2);
                 ImGui::PopStyleVar(3);
-                float lv = gEngine.meter[2 + z].load();
-                dl->AddLine(ImVec2(o.x + 68, ly + lane - 6), ImVec2(o.x + 68 + (w - 76) * lv, ly + lane - 6), LB(0.8f), 1.5f);
-                if (gFontSmall) ImGui::PushFont(gFontSmall);
-                // V = the volume, S = the signal (the live level line under it)
+                // the volume as a number, right of the header row
                 char vt[8]; snprintf(vt, sizeof vt, "%.0f", v * 100);
-                float lw = ImGui::CalcTextSize("V").x;
-                dl->AddText(ImVec2(o.x + 12, ly + lane - volH + 7), LB(0.55f), "V");
-                dl->AddText(ImVec2(o.x + 12 + lw + 6, ly + lane - volH + 7), W(0.5f), vt);
-                dl->AddText(ImVec2(o.x + 12, ly + lane - 13), W(0.32f), "S");
+                ImVec2 vts = ImGui::CalcTextSize(vt);
+                dl->AddText(ImVec2(o.x + w - 12 - vts.x, ly + 7), W(0.55f), vt);
                 if (gFontSmall) ImGui::PopFont();
             }
             // ease: the zone's level over the last ~13 s, a slow blue line under
@@ -3350,9 +3353,9 @@ static void drawWaveBody(float w, bool audio = false) {
                 int ew = gEngine.easeW.load(std::memory_order_relaxed);
                 float emax = 0.02f;
                 for (int i = 0; i < E; i++) emax = std::max(emax, gEngine.easeHist[z][i]);
-                float ex0 = o.x + 72, ex1 = o.x + w - 12;
+                float ex0 = lx + 4, ex1 = o.x + w - 12;
                 float eb = ly + lane - volH - 6;                       // baseline, just above the wave rect's floor
-                float eh = (lane - volH - 12) * 0.5f;                  // never above the centre line
+                float eh = (lane - volH - hdr - 12) * 0.5f;            // never above the centre line
                 static ImVec2 ep[Engine::kEaseLen];
                 for (int i = 0; i < E; i++) {
                     float v = gEngine.easeHist[z][(ew + i) % E] / emax;   // oldest → newest, left → right
@@ -3363,35 +3366,39 @@ static void drawWaveBody(float w, bool audio = false) {
                 }
                 dl->AddPolyline(ep, E, LB(0.14f), 0, 3.0f);
                 dl->AddPolyline(ep, E, LB(0.55f), 0, 1.2f);
-                if (gFontSmall) ImGui::PushFont(gFontSmall);
-                const char* et = "ease  ·  13 s";
-                ImVec2 ets = ImGui::CalcTextSize(et);
-                dl->AddText(ImVec2(ex1 - ets.x, ly + 7), LB(0.30f), et);   // top-right corner, off the traces
-                if (gFontSmall) ImGui::PopFont();
+                if (!audio) {                                          // (the Audio page says it in the wave's tooltip)
+                    if (gFontSmall) ImGui::PushFont(gFontSmall);
+                    const char* et = "ease  ·  13 s";
+                    ImVec2 ets = ImGui::CalcTextSize(et);
+                    dl->AddText(ImVec2(ex1 - ets.x, ly + 7), LB(0.30f), et);
+                    if (gFontSmall) ImGui::PopFont();
+                }
             }
             // auto-scale each ring to its own recent peak so every lane draws a full wave
             float gain = gScopeGain * 0.9f / std::max(peakOf(gEngine.vibScope[z]), 0.02f);
-            trace(1 + z, gEngine.vibScope[z], o.x + 72, o.x + w - 12, mid, amp, gain);
+            trace(1 + z, gEngine.vibScope[z], lx + 4, o.x + w - 12, mid, amp, gain);
             if (gFontSmall) ImGui::PushFont(gFontSmall);
-            dl->AddText(ImVec2(o.x + 12, mid - 13), W(0.75f), kZoneNames[z]);
             char hz[16]; snprintf(hz, sizeof hz, "%.0f Hz", gEngine.zoneHz[z].load());
-            dl->AddText(ImVec2(o.x + 12, mid + 1), W(0.30f), hz);
+            const ImVec2 nsz = ImGui::CalcTextSize(kZoneNames[z]);
+            // Audio page: name then pitch on one line above the wave. Elsewhere: stacked in the left gutter.
+            const ImVec2 npos = audio ? ImVec2(o.x + 14, ly + 7) : ImVec2(o.x + 12, mid - 13);
+            dl->AddText(npos, W(0.80f), kZoneNames[z]);
+            dl->AddText(audio ? ImVec2(npos.x + nsz.x + (layerFxActive(z) ? 22 : 10), npos.y) : ImVec2(o.x + 12, mid + 1), W(0.30f), hz);
             if (audio) {
                 // the name opens the layer's effects row; a blue dot marks a
                 // layer that has been singled out (any effect off its default)
-                ImVec2 ns = ImGui::CalcTextSize(kZoneNames[z]);
-                if (layerFxActive(z)) dl->AddCircleFilled(ImVec2(o.x + 12 + ns.x + 7, mid - 7), 2.5f, LB(0.85f));
-                ImGui::SetCursorScreenPos(ImVec2(o.x + 6, mid - 16));
+                if (layerFxActive(z)) dl->AddCircleFilled(ImVec2(npos.x + nsz.x + 9, npos.y + nsz.y * 0.5f), 2.5f, LB(0.85f));
+                ImGui::SetCursorScreenPos(ImVec2(o.x + 4, ly));
                 char nid[16]; snprintf(nid, sizeof nid, "##lane%d", z);
-                if (ImGui::InvisibleButton(nid, ImVec2(60, 34))) gLaneFx[z] = !gLaneFx[z];
+                if (ImGui::InvisibleButton(nid, ImVec2(std::max(120.0f, w * 0.45f), hdr))) gLaneFx[z] = !gLaneFx[z];
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip(fxOpen ? "close the layer effects" : "layer effects: tone · drive · pulse\n(kept across presets)");
             }
             if (gFontSmall) ImGui::PopFont();
             if (fxOpen) {
                 // TONE · DRIVE · PULSE: three thin sliders across the wave's width
                 float fy = ly + lane + 2;
-                dl->AddLine(ImVec2(o.x + 68, fy - 1), ImVec2(o.x + w - 8, fy - 1), W(0.05f), 1.0f);
-                const float fx0 = o.x + 68, fw = w - 76, gap = 14;
+                dl->AddLine(ImVec2(lx, fy - 1), ImVec2(o.x + w - 8, fy - 1), W(0.05f), 1.0f);
+                const float fx0 = lx + 4, fw = lw_ - 8, gap = fw < 420 ? 8 : 14;
                 const float colW = (fw - 2 * gap) / 3.0f, labW = 44;
                 struct FxDef { const char* name; std::atomic<float>* p; const char* tip; };
                 FxDef defs[3] = {

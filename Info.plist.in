@@ -6,8 +6,8 @@
   <key>CFBundleIdentifier</key><string>com.avartifacts.os</string>
   <key>CFBundleName</key><string>AVA OS</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>2.3</string>
-  <key>CFBundleVersion</key><string>23</string>
+  <key>CFBundleShortVersionString</key><string>2.4</string>
+  <key>CFBundleVersion</key><string>24</string>
   <key>CFBundleIconFile</key><string>AVA OS</string>
   <key>LSMinimumSystemVersion</key><string>14.4</string>
   <key>NSHumanReadableCopyright</key><string>© 2026 Audio Visual Artifacts</string>
