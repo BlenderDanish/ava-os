@@ -32,13 +32,16 @@ final class PadUIView: UIView {
         let dx = p.x - c.x, dy = p.y - c.y
         let dist = hypot(dx, dy)
         if dist < 1 { return (0, 0, 0.5) }
-        let theta = atan2(dy, dx)
-        var rel = theta - (-.pi / 2 + .pi / 8)
-        rel -= floor(rel / (2 * .pi)) * 2 * .pi
-        let k = min(7, Int(rel / (.pi / 4)))
-        let u = (theta - (-.pi / 2 + .pi / 4)) / (.pi / 4)
-        let delta = (u - u.rounded()) * (.pi / 4)
-        let f = dist * cos(delta) / (R * cos(.pi / 8))
+        // explicit CGFloat constants: the literal-heavy form is too slow to type-check
+        let pi = CGFloat.pi
+        let slice: CGFloat = pi / 4
+        let theta: CGFloat = atan2(dy, dx)
+        var rel: CGFloat = theta + pi / 2 - pi / 8
+        rel -= floor(rel / (2 * pi)) * 2 * pi
+        let k: Int = min(7, Int(rel / slice))
+        let u: CGFloat = (theta + pi / 2 - slice) / slice
+        let delta: CGFloat = (u - u.rounded()) * slice
+        let f: CGFloat = dist * cos(delta) / (R * cos(pi / 8))
         if f < bounds5[0] { return (0, k, 0.5) }
         for ring in 0..<4 where f < bounds5[ring + 1] {
             let frac = Float((f - bounds5[ring]) / (bounds5[ring + 1] - bounds5[ring]))
@@ -82,7 +85,7 @@ final class PadUIView: UIView {
     private func octPath(_ c: CGPoint, _ r: CGFloat) -> UIBezierPath {
         let path = UIBezierPath()
         for i in 0..<8 {
-            let a = -CGFloat.pi / 2 + .pi / 8 + CGFloat(i) * .pi / 4
+            let a: CGFloat = -CGFloat.pi / 2 + CGFloat.pi / 8 + CGFloat(i) * CGFloat.pi / 4
             let pt = CGPoint(x: c.x + r * cos(a), y: c.y + r * sin(a))
             i == 0 ? path.move(to: pt) : path.addLine(to: pt)
         }

@@ -59,7 +59,7 @@ jobs:
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build/dd \
             CODE_SIGNING_ALLOWED=NO \
-            | tee build.log | grep -E "error|warning: unre|BUILD|\*\*" || true
+            | tee build.log | grep -E "(error|warning):|BUILD (SUCCEEDED|FAILED)" || true
           grep -q "BUILD SUCCEEDED" build.log
       - name: Keep the build log
         if: always()
@@ -116,7 +116,7 @@ jobs:
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             "${EXTRA[@]}" \
-            | tee archive.log | grep -E "error|BUILD|ARCHIVE|\*\*" || true
+            | tee archive.log | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" || true
           grep -q "ARCHIVE SUCCEEDED" archive.log
       - name: Upload to App Store Connect
         working-directory: ipad
