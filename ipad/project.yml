@@ -1,3 +1,5 @@
+# AVA OS for iPhone and iPad.
+# Generate the Xcode project with:  xcodegen generate   (brew install xcodegen)
 name: AVAOS
 options:
   deploymentTarget:
@@ -7,6 +9,7 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "16.0"
+    scheme: {}
     sources:
       - path: App
       - path: ../src
@@ -25,21 +28,30 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.avartifacts.ava
         PRODUCT_NAME: "AVA OS"
+        MARKETING_VERSION: "1.1"
+        CURRENT_PROJECT_VERSION: "1"
         DEVELOPMENT_TEAM: JSWF5RVAU3
         CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.9"
         SWIFT_OBJC_BRIDGING_HEADER: App/Bridging.h
         CLANG_CXX_LANGUAGE_STANDARD: c++17
         HEADER_SEARCH_PATHS: "$(SRCROOT)/../src"
-        TARGETED_DEVICE_FAMILY: "2"
-        INFOPLIST_KEY_UIStatusBarHidden: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     info:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: AVA OS
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSMicrophoneUsageDescription: AVA OS listens to the music in the room to drive the vibroacoustic zones. The microphone is never recorded.
+        NSLocalNetworkUsageDescription: AVA OS talks to the AVA bed controller on your Wi-Fi network.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        ITSAppUsesNonExemptEncryption: false
         UIBackgroundModes: [audio]
         UILaunchScreen: {}
         UIRequiresFullScreen: true
-        UISupportedInterfaceOrientations: [UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight, UIInterfaceOrientationPortrait]
+        UIUserInterfaceStyle: Dark
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight, UIInterfaceOrientationPortrait]
